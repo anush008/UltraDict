@@ -1,7 +1,7 @@
 #
 # UltraDict
 #
-# A sychronized, streaming Python dictionary that uses shared memory as a backend
+# A synchronized, streaming Python dictionary that uses shared memory as a backend
 #
 # Copyright [2022] [Ronny Rentner] [ultradict.code@ronny-rentner.de]
 #

@@ -1,7 +1,7 @@
 #
 # UltraDict
 #
-# A sychronized, streaming Python dictionary that uses shared memory as a backend
+# A synchronized, streaming Python dictionary that uses shared memory as a backend
 #
 # Copyright [2022] [Ronny Rentner] [ultradict.code@ronny-rentner.de]
 #
@@ -298,7 +298,7 @@ class UltraDict(collections.UserDict, dict):
             if hasattr(self, 'pid_remote_ctx'):
                 self.pid_remote_ctx.__exit__(None, None, None)
                 del self.pid_remote_ctx
-            if hasattr(self, 'pid_remote_aotmic'):
+            if hasattr(self, 'pid_remote_atomic'):
                 del self.pid_remote_atomic
             del self.lock_remote
             del self.pid_remote
@@ -439,7 +439,7 @@ class UltraDict(collections.UserDict, dict):
             if recurse is None:
                 recurse = recurse_remote
             elif recurse != recurse_remote:
-                raise Exceptions.ParameterMismatch(f"recure={recurse} was set but the creator has used recurse={recurse_remote}")
+                raise Exceptions.ParameterMismatch(f"recurse={recurse} was set but the creator has used recurse={recurse_remote}")
 
             # Got existing size of full dump memory, that must mean it's static size
             # and we should attach to it
@@ -768,7 +768,7 @@ class UltraDict(collections.UserDict, dict):
                 # Iterate over all updates until the start of the last update
                 while pos < int.from_bytes(self.update_stream_position_remote, 'little'):
                     # Read header
-                    # The first byte should be a FF byte to introduce the headerfull_dump_counter_remote
+                    # The first byte should be a FF byte to introduce the header
                     assert bytes(self.buffer.buf[pos:pos+1]) == b'\xFF'
                     pos += 1
                     # Then comes 4 bytes of length
@@ -855,20 +855,19 @@ class UltraDict(collections.UserDict, dict):
 
             # Append the update to the update stream
             self.append_update(key, item)
-            # TODO: Do something if append_u int.from_bytes(self.update_stream_position_remote, 'little')pdate() fails
+            # TODO: Do something if append_update() fails
 
     def __getitem__(self, key):
         #log.debug("__getitem__ {}", key)
         self.apply_update()
         return self.data[key]
 
-    # deprecated in Python 3
-    def has_key(self, key):
-        self.apply_update()
-        return key in self.data
-
     def __eq__(self, other):
-        return self.apply_update() == other.apply_update()
+        self.apply_update()
+        if isinstance(other, UltraDict):
+            other.apply_update()
+            return self.data == other.data
+        return self.data == other
 
     def __contains__(self, key):
         self.apply_update()

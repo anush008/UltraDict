@@ -13,7 +13,7 @@ ext = Extension(name="UltraDict", sources=["UltraDict.py"])
 setup(
     name='UltraDict',
     version=version,
-    description='Sychronized, streaming dictionary that uses shared memory as a backend',
+    description='Synchronized, streaming dictionary that uses shared memory as a backend',
     long_description=long_description,
     long_description_content_type='text/markdown',
     author='Ronny Rentner',
