@@ -518,11 +518,8 @@ class UltraDictTests(unittest.TestCase):
         # tests/api_check_expected.txt is the output of tests/api_check.py with the original
         # implementation of UltraDict, plus the bug fixes listed in readme.md. Every other step
         # of the API must still behave the same.
-        # Some versions of Python differ in the standard library, e.g. Python 3.8 has no `|` operator
-        # for dicts and pickle on Python 3.14 raises PicklingError for a lambda
-        if sys.version_info < (3, 9):
-            expected_file = 'tests/api_check_expected_py38.txt'
-        elif sys.version_info >= (3, 14):
+        # Pickle on Python 3.14 raises PicklingError for a lambda, earlier versions AttributeError
+        if sys.version_info >= (3, 14):
             expected_file = 'tests/api_check_expected_py314.txt'
         else:
             expected_file = 'tests/api_check_expected.txt'

@@ -9,13 +9,13 @@ Features:
 * No running manager processes
 * Works in spawn and fork context
 * Safe locking between independent processes
-* Tested with Python >= v3.8 on Linux, Windows and Mac
+* Tested with Python >= 3.11 on Linux, Windows and Mac
 * Convenient, no setter or getters necessary
 * Optional recursion for nested dicts
 
 [![PyPI Package](https://img.shields.io/pypi/v/ultradict.svg)](https://pypi.org/project/ultradict)
 [![Run Python Tests](https://github.com/ronny-rentner/UltraDict/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ronny-rentner/UltraDict/actions/workflows/ci.yml)
-[![Python >=3.8](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python >=3.11](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/github/license/ronny-rentner/UltraDict.svg)](https://github.com/ronny-rentner/UltraDict/blob/master/LICENSE.md)
 
 ## General Concept

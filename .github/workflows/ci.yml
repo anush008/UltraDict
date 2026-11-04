@@ -42,12 +42,11 @@ jobs:
             os: windows-2025
             arch: x86
         # Run in all these versions of Python
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - name: Install Python ${{ matrix.python-version }}
-        # v7 removes end-of-life Python versions, this matrix still tests 3.8 and 3.9
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.config.arch }}

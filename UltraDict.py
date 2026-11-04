@@ -333,8 +333,6 @@ class UltraDict(collections.UserDict, FastCore):
 
                 # If set to 0, we practically have a busy wait
                 if sleep_time:
-                    # On Python < 3.10, this smallest possible time is actually rather big,
-                    #  maybe around 10 ms, depending on your CPU.
                     time.sleep(sleep_time)
 
                 if not block:
