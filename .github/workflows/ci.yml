@@ -57,16 +57,23 @@ jobs:
           pip install psutil
           # Manually install pylint as long as we don't build the wheels
           #pip install pylint
+      - name: Install atomics from source on macOS arm64
+        # The atomics 1.0.3 wheel for macOS arm64 contains a native library for x86_64
+        if: matrix.config.name == 'macos-arm64'
+        run: pip install --force-reinstall --no-binary atomics atomics
       - name: Run unit tests without the C extension
         run: python -m unittest
         env:
           ULTRADICT_PURE_PYTHON: 1
       - name: Build the C extension
+        # Also test the C extension when the tests without it fail
+        if: success() || failure()
         run: |
           pip install cython setuptools
           cythonize -3 -i _fast.pyx
           python -c "import sys; sys.path.insert(0, '..'); from UltraDict import UltraDict; assert UltraDict.accelerated"
       - name: Run unit tests with the C extension
+        if: success() || failure()
         run: python -m unittest
           #- name: Run pylint
           #run: pylint UltraDict.py

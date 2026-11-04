@@ -21,7 +21,7 @@
 __all__ = ['UltraDict']
 
 import multiprocessing, multiprocessing.shared_memory, multiprocessing.synchronize
-import collections, marshal, os, pickle, struct, sys, time, weakref
+import collections, marshal, os, pickle, platform, struct, sys, time, weakref, zlib
 import importlib.util, importlib.machinery
 
 try:
@@ -70,10 +70,22 @@ def remove_shm_from_resource_tracker():
 #More details at: https://bugs.python.org/issue38119
 remove_shm_from_resource_tracker()
 
-# Header of each record in the update stream and in the full dump memory:
-# one marker byte, 4 bytes little endian length of the body, one FF byte
-HEADER = struct.Struct('<BIB')
+# Header of each record in the update stream: one marker byte, 4 bytes little endian length
+# of the body, 4 bytes little endian CRC32 of the body and one FF byte.
+# The CRC32 is `zlib.crc32(body, full_dump_counter)`. Readers check it before they parse a record,
+# so they never parse a record that is not complete yet, or one from before the last full dump.
+HEADER = struct.Struct('<BIIB')
 HEADER_SIZE = HEADER.size
+
+# Header of a full dump: FF byte, 4 bytes little endian length of the body, 4 bytes little endian
+# CRC32 of the body and one FF byte. The CRC32 is `zlib.crc32(body, full_dump_counter)` with the
+# full dump counter that the full dump belongs to. A reader that sees the new counter before the
+# new full dump, e.g. on a CPU with weak memory order, finds a wrong CRC32 and tries again.
+FULL_DUMP_HEADER = struct.Struct('<BIIB')
+FULL_DUMP_HEADER_SIZE = FULL_DUMP_HEADER.size
+
+class FullDumpMismatch(Exception):
+    """ The full dump does not belong to the full dump counter, see FULL_DUMP_HEADER """
 
 # The first byte of a record header tells how its body is serialized.
 # Full dumps always use MARKER_SERIALIZER.
@@ -96,7 +108,7 @@ ACCELERATED = False
 if not os.environ.get('ULTRADICT_PURE_PYTHON'):
     try:
         from . import _fast
-        if getattr(_fast, 'VERSION', None) == 1:
+        if getattr(_fast, 'VERSION', None) == 3:
             ACCELERATED = True
     except ImportError:
         pass
@@ -108,6 +120,29 @@ else:
     FastCore = dict
     class SharedLockCore():
         __slots__ = ()
+
+# Readers do not lock, so writers must make a record visible before the stream position that
+# points to it. x86 CPUs keep the order of stores and of loads. Other CPUs, e.g. arm64, can
+# reorder them and need memory barriers. The C extension uses barriers. Pure Python code cannot,
+# so on these CPUs, readers without the C extension apply changes while holding the lock.
+# Set ULTRADICT_LOCKED_REPLAY=1 to use the lock on all CPUs, e.g. to test this code path.
+WEAK_MEMORY_ORDER = platform.machine().lower() not in ('x86_64', 'amd64', 'i386', 'i686', 'x86')
+LOCKED_REPLAY = not ACCELERATED and (WEAK_MEMORY_ORDER or bool(os.environ.get('ULTRADICT_LOCKED_REPLAY')))
+# Maximum time in seconds that a read waits for the lock, see `UltraDict.acquire_for_replay()`
+REPLAY_LOCK_TIMEOUT = 0.1
+# Pauses in seconds before a reader reads a bad record again, see `UltraDict.apply_update_unlocked()`
+RECORD_RETRY_DELAYS = (0, 0.0001, 0.001, 0.01, 0.1)
+
+# Errors that a bad record in the update stream raises.
+# EOFError and ValueError come from marshal on a damaged record.
+RECORD_ERRORS = (AssertionError, struct.error, pickle.UnpicklingError, EOFError, ValueError)
+
+if ACCELERATED:
+    # Full memory barrier, used around full dumps
+    memory_fence = _fast.fence
+else:
+    def memory_fence():
+        """ Pure Python has no memory barrier, see LOCKED_REPLAY """
 
 def make_fast_exchange(atomic):
     """
@@ -191,19 +226,32 @@ class UltraDict(collections.UserDict, FastCore):
 
             self.init_pid()
 
-            try:
-                self.ctx = atomics.atomicview(buffer=self.lock_remote[0:1], atype=atomics.BYTES)
-                self.pid_remote_ctx = atomics.atomicview(buffer=self.pid_remote[0:4], atype=atomics.BYTES)
-            except NameError as e:
-                self.cleanup()
-                raise e
-            self.lock_atomic = self.ctx.__enter__()
-            self.pid_remote_atomic = self.pid_remote_ctx.__enter__()
-
             if ACCELERATED:
-                # The C base class works on the lock byte and the PID bytes directly
+                # The C base class works on the lock byte and the PID bytes directly,
+                # it does not need the atomics package
                 self._bind(self.lock_remote, self.pid_remote)
             else:
+                load_error = None
+                try:
+                    self.ctx = atomics.atomicview(buffer=self.lock_remote[0:1], atype=atomics.BYTES)
+                    self.pid_remote_ctx = atomics.atomicview(buffer=self.pid_remote[0:4], atype=atomics.BYTES)
+                except NameError as e:
+                    self.cleanup()
+                    raise e
+                except OSError as e:
+                    # The native library of atomics cannot be loaded, e.g. the atomics 1.0.3
+                    # wheel for macOS arm64 contains a library for x86_64
+                    load_error = str(e)
+                if load_error is not None:
+                    # Raised outside of the except block, so the traceback of the OSError and the
+                    # half created atomics objects with their exports of the shared memory are freed
+                    self.cleanup()
+                    raise Exceptions.MissingDependency(
+                        f"The `atomics` package cannot load its native library ({load_error}). "
+                        "Build the UltraDict C extension, or install atomics from source with "
+                        "`pip install --force-reinstall --no-binary atomics atomics`.")
+                self.lock_atomic = self.ctx.__enter__()
+                self.pid_remote_atomic = self.pid_remote_ctx.__enter__()
                 self.exchange = make_fast_exchange(self.lock_atomic) or self.exchange_public_api
 
             def after_fork():
@@ -360,12 +408,15 @@ class UltraDict(collections.UserDict, FastCore):
 
             # Stealing the lock means actually just putting our pid into the shared memory overwriting the other pid.
             # This can go wrong if the lock owner is actually still alive and working.
-            result = self.pid_remote_atomic.cmpxchg_strong(expected=from_pid.to_bytes(4, 'little'), desired=self.pid_bytes)
-            if result.success:
+            if ACCELERATED:
+                success = self.compare_exchange_pid(from_pid.to_bytes(4, 'little'), self.pid_bytes)
+            else:
+                success = self.pid_remote_atomic.cmpxchg_strong(expected=from_pid.to_bytes(4, 'little'), desired=self.pid_bytes).success
+            if success:
                 self.has_lock = 1
                 if release:
                     self.release()
-            return result.success
+            return success
 
         def steal_from_dead(self, from_pid=0, release=False):
             """ Check if from_pid is actually a dead process and if yes, steal the lock from it.
@@ -722,6 +773,8 @@ class UltraDict(collections.UserDict, FastCore):
 
             marshalled = self.serializer.dumps(self.data)
             length = len(marshalled)
+            # The full dump belongs to the next value of the counter, see FULL_DUMP_HEADER
+            new_full_dump_counter = self.full_dump_counter_remote[0] + 1
 
             # If we don't have a fixed size, let's create full dump memory dynamically
             # TODO: This causes issues on Windows because the memory is not persistant
@@ -730,23 +783,17 @@ class UltraDict(collections.UserDict, FastCore):
                 full_dump_memory = self.full_dump_memory
             else:
                 # Dynamic full dump memory
-                full_dump_memory = self.get_memory(create=True, size=length + 6)
+                full_dump_memory = self.get_memory(create=True, size=length + FULL_DUMP_HEADER_SIZE)
 
             #log.debug("Full dump memory: ", full_dump_memory)
 
-            if length + 6 > full_dump_memory.size:
-                raise Exceptions.FullDumpMemoryFull(f'Full dump memory too small for full dump: needed={length + 6} got={full_dump_memory.size}')
+            if length + FULL_DUMP_HEADER_SIZE > full_dump_memory.size:
+                raise Exceptions.FullDumpMemoryFull(f'Full dump memory too small for full dump: needed={length + FULL_DUMP_HEADER_SIZE} got={full_dump_memory.size}')
 
-            # Write header, 6 bytes
-            # First byte is FF byte
-            full_dump_memory.buf[0:1] = b'\xFF'
-            # Then comes 4 bytes of length of the body
-            full_dump_memory.buf[1:5] = length.to_bytes(4, 'little')
-            # Then another FF bytes, end of header
-            full_dump_memory.buf[5:6] = b'\xFF'
-
-            # Write body
-            full_dump_memory.buf[6:6+length] = marshalled
+            # Write body, then header, see FULL_DUMP_HEADER
+            full_dump_memory.buf[FULL_DUMP_HEADER_SIZE:FULL_DUMP_HEADER_SIZE + length] = marshalled
+            checksum = zlib.crc32(marshalled, new_full_dump_counter & 0xFFFFFFFF)
+            FULL_DUMP_HEADER.pack_into(full_dump_memory.buf, 0, 0xFF, length, checksum, 0xFF)
 
             # On Windows, if we close it, it cannot be read anymore by anyone else.
             if not self.full_dump_size and sys.platform != 'win32':
@@ -760,12 +807,17 @@ class UltraDict(collections.UserDict, FastCore):
             if not (self.full_dump_size and self.full_dump_memory):
                 self.full_dump_memory_name_remote[:] = full_dump_memory.name.encode('utf-8').ljust(255)
 
+            # The full dump and its name must be visible to other processes before the
+            # stream position and the counter change, see `memory_fence()`
+            memory_fence()
+
             # Reset the stream position to zero as we have
             # just provided a fresh new full dump.
             # This must happen before the counter is incremented: a reader that sees the new
             # counter loads the full dump and then must not replay old records of the stream.
             self.update_stream_position = 0
             self.update_stream_position_remote[0] = 0
+            memory_fence()
 
             self.full_dump_counter += 1
             current = self.full_dump_counter_remote[0]
@@ -816,7 +868,21 @@ class UltraDict(collections.UserDict, FastCore):
         There is a rare case where a full dump is replaced with a newer full dump while
         we didn't have the chance to load the old one. In this case, we just retry.
         """
+        # A full dump that does not match the counter yet can arrive a moment later,
+        # see FULL_DUMP_HEADER
+        for delay in RECORD_RETRY_DELAYS:
+            time.sleep(delay)
+            try:
+                return self.load_once(force=force)
+            except FullDumpMismatch:
+                pass
+        raise AssertionError("The full dump does not match the full dump counter")
+
+    def load_once(self, force=False):
+        """ See `load()` """
         full_dump_counter = self.full_dump_counter_remote[0]
+        # Read the name and the full dump only after the counter, see `memory_fence()`
+        memory_fence()
         #log.debug("Loading full dump local_counter={} remote_counter={}", self.full_dump_counter, full_dump_counter)
         try:
             if force or (self.full_dump_counter < full_dump_counter):
@@ -827,21 +893,17 @@ class UltraDict(collections.UserDict, FastCore):
                     full_dump_memory = self.get_full_dump_memory()
 
                 buf = full_dump_memory.buf
-                pos = 0
 
-                # Read header
-                # The first byte should be a FF byte to introduce the header
-                assert bytes(buf[pos:pos+1]) == b'\xFF'
-                pos += 1
-                # Then comes 4 bytes of length
-                length = int.from_bytes(bytes(buf[pos:pos+4]), 'little')
-                assert length > 0, (self.status(), full_dump_memory, bytes(buf[:]).decode('utf-8').strip().strip('\x00'), len(buf))
-                pos += 4
-                #log.debug("Found update, pos={} length={}", pos, length)
-                assert bytes(buf[pos:pos+1]) == b'\xFF'
-                pos += 1
-                # Unserialize the update data, we expect a tuple of key and value
-                self.data = self.serializer.loads(bytes(buf[pos:pos+length]))
+                # Read header, see FULL_DUMP_HEADER
+                start_marker, length, checksum, end_marker = FULL_DUMP_HEADER.unpack_from(buf, 0)
+                body = bytes(buf[FULL_DUMP_HEADER_SIZE:FULL_DUMP_HEADER_SIZE + length])
+                if start_marker != 0xFF or end_marker != 0xFF or length <= 0 \
+                        or zlib.crc32(body, full_dump_counter & 0xFFFFFFFF) != checksum:
+                    if sys.platform != 'win32' and not self.full_dump_memory:
+                        full_dump_memory.close()
+                    raise FullDumpMismatch()
+                # Unserialize the full dump
+                self.data = self.serializer.loads(body)
                 self.full_dump_counter = full_dump_counter
                 self.update_stream_position = 0
 
@@ -854,7 +916,7 @@ class UltraDict(collections.UserDict, FastCore):
             if full_dump_delta > 1:
                 # If more than one new full dump was created during the time we were trying to load one full dump
                 # it can happen that our full dump has just disappeared
-                return self.load(force=True)
+                return self.load_once(force=True)
             # TODO: Before we reach max recursion depth, try to load the full dump using a lock
             self.print_status()
             raise e
@@ -906,8 +968,9 @@ class UltraDict(collections.UserDict, FastCore):
         # Write header and body directly into the shared memory, without
         # concatenating them in a temporary bytes object first
         buf = self.buffer_remote
-        HEADER.pack_into(buf, start_position, marker, length, 0xFF)
+        checksum = zlib.crc32(marshalled, self.full_dump_counter & 0xFFFFFFFF)
         buf[start_position + HEADER_SIZE:end_position] = marshalled
+        HEADER.pack_into(buf, start_position, marker, length, checksum, 0xFF)
 
         # Inform others about it, only after the full record is written
         self.update_stream_position = end_position
@@ -918,6 +981,31 @@ class UltraDict(collections.UserDict, FastCore):
     def apply_update(self):
         """ Opportunistically apply dict changes from shared memory stream without any locking.  """
 
+        if LOCKED_REPLAY and self.changed() and self.acquire_for_replay():
+            # See LOCKED_REPLAY. Writers release the lock only after their changes are complete.
+            try:
+                return self.apply_update_unlocked()
+            finally:
+                self.fast_lock.release()
+        return self.apply_update_unlocked()
+
+    def acquire_for_replay(self):
+        """
+        Try to get the lock for at most REPLAY_LOCK_TIMEOUT seconds, see LOCKED_REPLAY.
+        Reads must never wait long, e.g. for a stale lock of a crashed process.
+        If the lock is not free in time, the read continues without the lock.
+        """
+        lock = self.fast_lock
+        try:
+            if isinstance(lock, UltraDict.SharedLock):
+                return lock.acquire(timeout=REPLAY_LOCK_TIMEOUT)
+            return lock.acquire(True, REPLAY_LOCK_TIMEOUT)
+        except Exceptions.CannotAcquireLock:
+            return False
+
+    def apply_update_unlocked(self):
+        """ See `apply_update()` """
+
         if self.full_dump_counter < self.full_dump_counter_remote[0]:
             self.load(force=True)
 
@@ -925,24 +1013,39 @@ class UltraDict(collections.UserDict, FastCore):
             try:
                 if self.replay_stream():
                     # A new full dump appeared while we were reading the stream
-                    return self.apply_update()
-            except (AssertionError, struct.error, pickle.UnpicklingError, EOFError, ValueError) as e:
-                # EOFError and ValueError come from marshal on a damaged record
+                    return self.apply_update_unlocked()
+            except RECORD_ERRORS:
 
                 # It can happen that a slow process is not fast enough reading the stream and some
                 # other process already got around overwriting the current position. It is possible to
                 # recover from this situation if and only if a new, fresh full dump exists that can be loaded.
                 if self.full_dump_counter < self.full_dump_counter_remote[0]:
                     log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
-                    return self.apply_update()
+                    return self.apply_update_unlocked()
 
                 # As a last resort, let's get a lock. This way we are safe but slow.
                 with self.fast_lock:
                     if self.full_dump_counter < self.full_dump_counter_remote[0]:
                         log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
-                        return self.apply_update()
+                        return self.apply_update_unlocked()
 
-                raise e
+                    # On CPUs with weak memory order, a writer without the C extension can make
+                    # the stream position visible before the record. If the writers use the same
+                    # lock, the record is complete now, because they release the lock only after
+                    # writing. A reader that attached by name with the default lock has its own
+                    # lock, so wait a moment for the record to arrive. A record that is still bad
+                    # after all retries is damaged.
+                    for delay in RECORD_RETRY_DELAYS:
+                        time.sleep(delay)
+                        if self.full_dump_counter < self.full_dump_counter_remote[0]:
+                            return self.apply_update_unlocked()
+                        try:
+                            if self.replay_stream():
+                                return self.apply_update_unlocked()
+                            return None
+                        except RECORD_ERRORS:
+                            if delay == RECORD_RETRY_DELAYS[-1]:
+                                raise
 
     def replay_stream_python(self):
         """
@@ -965,7 +1068,7 @@ class UltraDict(collections.UserDict, FastCore):
         # Iterate over all updates until the start of the last update
         while pos < remote_position[0]:
             # Read header, it is a marker byte, 4 bytes of length and a FF byte
-            marker, length, end_marker = HEADER.unpack_from(buf, pos)
+            marker, length, checksum, end_marker = HEADER.unpack_from(buf, pos)
             if end_marker != 0xFF:
                 raise AssertionError(f"Bad header in update stream at position {pos}")
             pos += HEADER_SIZE
@@ -976,6 +1079,10 @@ class UltraDict(collections.UserDict, FastCore):
             record = bytes(buf[pos:pos+length])
             if self.full_dump_counter != full_dump_counter_remote[0]:
                 return True
+
+            # Never parse a record that is not complete, see HEADER
+            if zlib.crc32(record, self.full_dump_counter & 0xFFFFFFFF) != checksum:
+                raise AssertionError(f"Bad checksum in update stream at position {pos - HEADER_SIZE}")
 
             # Unserialize the update data, we expect a tuple of mode, key and value
             if marker == MARKER_MARSHAL:
@@ -1145,8 +1252,9 @@ class UltraDict(collections.UserDict, FastCore):
                     return
 
                 buf = self.buffer_remote
-                HEADER.pack_into(buf, start_position, marker, length, 0xFF)
+                checksum = zlib.crc32(marshalled, self.full_dump_counter & 0xFFFFFFFF)
                 buf[start_position + HEADER_SIZE:end_position] = marshalled
+                HEADER.pack_into(buf, start_position, marker, length, checksum, 0xFF)
 
                 # Inform others about it, only after the full record is written
                 self.update_stream_position = end_position

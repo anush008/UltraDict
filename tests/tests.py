@@ -2,6 +2,7 @@ import unittest
 import subprocess
 import sys
 import os
+import time
 
 sys.path.insert(0, '..')
 from UltraDict import UltraDict
@@ -185,6 +186,69 @@ class UltraDictTests(unittest.TestCase):
                 del expected[key]
                 self.assertNotIn(key, by_key_other)
         self.assertEqual(len(by_key_other), 0)
+
+    def test_record_visible_later(self):
+        # On CPUs with weak memory order, a reader can see the new stream position before the
+        # record. Simulate it: publish the position first and write the record a moment later.
+        import threading, pickle, zlib
+        ultra = UltraDict(buffer_size=10_000)
+        other = UltraDict(name=ultra.name)
+        ultra['before'] = 1
+        self.assertEqual(other['before'], 1)
+
+        module = sys.modules['UltraDict.UltraDict']
+        body = pickle.dumps((True, 'late', 2))
+        start = ultra.update_stream_position_remote[0]
+        end = start + module.HEADER_SIZE + len(body)
+        ultra.buffer.buf[start:end] = bytes(end - start)
+        ultra.update_stream_position = end
+        ultra.update_stream_position_remote[0] = end
+
+        def write_record():
+            time.sleep(0.02)
+            # The body first, then the header, like a writer that reorders its stores
+            ultra.buffer.buf[start + module.HEADER_SIZE:end] = body
+            checksum = zlib.crc32(body, ultra.full_dump_counter)
+            module.HEADER.pack_into(ultra.buffer.buf, start, 0xFF, len(body), checksum, 0xFF)
+
+        writer = threading.Thread(target=write_record)
+        writer.start()
+        try:
+            self.assertEqual(other['late'], 2)
+        finally:
+            writer.join()
+
+    def test_full_dump_visible_later(self):
+        # On CPUs with weak memory order, a reader can see the new full dump counter before the
+        # name of the new full dump. Simulate it: publish the counter first and the name later.
+        import threading, pickle, zlib
+        module = sys.modules['UltraDict.UltraDict']
+        ultra = UltraDict({'a': 1})
+        other = UltraDict(name=ultra.name)
+        ultra.dump()
+        self.assertEqual(other['a'], 1)
+
+        new_counter = ultra.full_dump_counter_remote[0] + 1
+        body = pickle.dumps({'a': 2})
+        memory = UltraDict.get_memory(create=True, size=module.FULL_DUMP_HEADER_SIZE + len(body))
+        memory.buf[module.FULL_DUMP_HEADER_SIZE:module.FULL_DUMP_HEADER_SIZE + len(body)] = body
+        module.FULL_DUMP_HEADER.pack_into(memory.buf, 0, 0xFF, len(body), zlib.crc32(body, new_counter), 0xFF)
+        ultra.update_stream_position = 0
+        ultra.update_stream_position_remote[0] = 0
+        ultra.full_dump_counter = new_counter
+        ultra.full_dump_counter_remote[0] = new_counter
+
+        def publish_name():
+            time.sleep(0.02)
+            ultra.full_dump_memory_name_remote[:] = memory.name.encode('utf-8').ljust(255)
+
+        writer = threading.Thread(target=publish_name)
+        writer.start()
+        try:
+            self.assertEqual(other['a'], 2)
+        finally:
+            writer.join()
+            memory.close()
 
     def test_threads(self):
         # The default lock also protects against other threads in the same process
@@ -377,7 +441,8 @@ class UltraDictTests(unittest.TestCase):
     def test_full_dump_resets_stream(self):
         ultra = UltraDict(buffer_size=1000)
         other = UltraDict(name=ultra.name)
-        for i in range(1000):
+        # The real buffer can be bigger, e.g. 16 KB pages on macOS arm64. Each record is at least 10 bytes.
+        for i in range(ultra.buffer_size // 10 * 3):
             ultra[i] = i
             self.assertEqual(other[i], i)
         self.assertGreater(ultra.full_dump_counter, 1)
