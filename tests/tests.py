@@ -417,6 +417,10 @@ class UltraDictTests(unittest.TestCase):
 
         # The owner unlinks the whole tree, even if a nested UltraDict is gone already
         owner.close()
+        # On Windows, shared memory is gone only when every handle is closed. PyPy closes the
+        # handles of unreferenced UltraDicts only when its garbage collector runs.
+        del shared, deeper
+        gc.collect()
         self.assertFalse(exists(register))
         self.assertFalse(any(exists(name) for name in children))
 
