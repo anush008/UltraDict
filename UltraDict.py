@@ -115,6 +115,72 @@ if not os.environ.get('ULTRADICT_PURE_PYTHON') and sys.implementation.name == 'c
     except ImportError:
         pass
 
+# On PyPy, cffi pointers to the two counters in the control memory are much faster than an index
+# into a cast memoryview, because the JIT turns them into plain loads and stores, see `init_remotes()`.
+# cffi is part of PyPy. ULTRADICT_PURE_PYTHON=1 also disables this.
+PYPY_CFFI = False
+if PYPY and not os.environ.get('ULTRADICT_PURE_PYTHON'):
+    try:
+        import cffi
+        ffi = cffi.FFI()
+        PYPY_CFFI = True
+    except ImportError:
+        pass
+
+# Writes the 4 bytes of a PID into a memoryview. On PyPy, `pack_into()` is much faster than a slice assignment.
+PID_BYTES = struct.Struct('4s')
+NO_PID = b'\x00\x00\x00\x00'
+
+MARSHAL_INT32 = struct.Struct('<i')
+MARSHAL_UINT32 = struct.Struct('<I')
+MARSHAL_FLOAT = struct.Struct('<d')
+
+def marshal_simple(value):
+    """
+    Return `value` in the marshal format, or None if this function does not support the value.
+    Supports the exact types in MARSHAL_TYPES, except int values outside of 32 bits and str
+    values that UTF-8 cannot encode, e.g. lone surrogates. See `marshal_dumps_simple()`.
+    """
+    value_type = type(value)
+    if value_type is str:
+        try:
+            encoded = value.encode('utf-8')
+        except UnicodeEncodeError:
+            return None
+        return b'u' + MARSHAL_UINT32.pack(len(encoded)) + encoded
+    if value_type is int:
+        if -0x80000000 <= value <= 0x7FFFFFFF:
+            return b'i' + MARSHAL_INT32.pack(value)
+        return None
+    if value_type is bool:
+        return b'T' if value else b'F'
+    if value is None:
+        return b'N'
+    if value_type is float:
+        return b'g' + MARSHAL_FLOAT.pack(value)
+    if value_type is bytes:
+        return b's' + MARSHAL_UINT32.pack(len(value)) + value
+    return None
+
+def marshal_dumps_simple(change, version=MARSHAL_VERSION):
+    """
+    Serialize a change `(mode, key, item)` in the marshal format. `marshal.loads()` returns the
+    same change as for the result of `marshal.dumps(change, version)`.
+
+    On PyPy, `marshal.dumps()` is slow, and the JIT compiles this function to a few
+    allocations and copies. Values that `marshal_simple()` does not support use `marshal.dumps()`.
+    """
+    mode, key, item = change
+    marshalled_key = marshal_simple(key)
+    marshalled_item = marshal_simple(item)
+    if marshalled_key is None or marshalled_item is None:
+        return marshal.dumps(change, version)
+    # A tuple of three items, then the mode as bool
+    return (b')\x03T' if mode else b')\x03F') + marshalled_key + marshalled_item
+
+# `marshal.dumps()` of CPython is fast already
+marshal_dumps = marshal_dumps_simple if PYPY else marshal.dumps
+
 if ACCELERATED:
     FastCore = _fast.FastCore
     SharedLockCore = _fast.SharedLockCore
@@ -330,7 +396,7 @@ class UltraDict(collections.UserDict, FastCore):
                     # If nobody had owned the lock, so the remote pid should be zero
                     assert self.pid_remote == b'\x00\x00\x00\x00'
 
-                    self.pid_remote[:] = self.pid_bytes
+                    PID_BYTES.pack_into(self.pid_remote, 0, self.pid_bytes)
                     return True
 
                 # If set to 0, we practically have a busy wait
@@ -377,7 +443,7 @@ class UltraDict(collections.UserDict, FastCore):
                     self.has_lock -= 1
                     # Last local lock released, release shared lock
                     if not self.has_lock:
-                        self.pid_remote[:] = b'\x00\x00\x00\x00'
+                        PID_BYTES.pack_into(self.pid_remote, 0, NO_PID)
                         self.test_and_dec()
                     #log.debug("Relased lock, lock={} pid_remote={}", self.has_lock, int.from_bytes(self.pid_remote, 'little'))
                     return True
@@ -528,8 +594,7 @@ class UltraDict(collections.UserDict, FastCore):
     CORE_ATTRS = 'data', 'update_stream_position', 'full_dump_counter', 'buffer_size', \
         'serializer', 'recurse', 'fast_lock', 'use_marshal'
 
-    __slots__ = python_attrs(STATUS_ATTRS + ('fast_lock', 'use_marshal', 'buffer_remote',
-        'update_stream_position_bytes_remote', 'full_dump_counter_bytes_remote'), CORE_ATTRS)
+    __slots__ = python_attrs(STATUS_ATTRS + ('fast_lock', 'use_marshal', 'buffer_remote', 'buffer_pointer_remote'), CORE_ATTRS)
 
     # True if the C extension module `_fast` is used
     accelerated = ACCELERATED
@@ -589,6 +654,9 @@ class UltraDict(collections.UserDict, FastCore):
         # Keep a direct reference to the memory view of the stream buffer,
         # `SharedMemory.buf` is a property and slower to access
         self.buffer_remote = self.buffer.buf
+        if PYPY_CFFI:
+            # See `init_remotes()`
+            self.buffer_pointer_remote = ffi.cast('char *', ffi.from_buffer('unsigned char[]', self.buffer.buf, require_writable=True))
         if ACCELERATED:
             # The C base class reads and writes the control memory and the stream buffer directly
             self._bind(self.control.buf, self.buffer.buf)
@@ -724,14 +792,19 @@ class UltraDict(collections.UserDict, FastCore):
         # 4 bytes integer, so reading them is a simple index access, e.g.
         # `self.update_stream_position_remote[0]`. They use the native byte order.
         # This is safe because shared memory never leaves the machine.
-        self.update_stream_position_remote = self.control.buf[ 0:  4].cast('I')
+        if PYPY_CFFI:
+            # On PyPy, the counters are cffi pointers with the same `[0]` access, see PYPY_CFFI.
+            # A pointer does not stop `close()` from releasing the memory. `del_remotes()` deletes
+            # them before, and code must never keep them in local variables while it runs other
+            # code, e.g. the serializer, which can close this UltraDict.
+            control = ffi.from_buffer('unsigned char[]', self.control.buf, require_writable=True)
+            self.update_stream_position_remote = ffi.cast('uint32_t *', control)
+            self.full_dump_counter_remote      = ffi.cast('uint32_t *', control + 10)
+        else:
+            self.update_stream_position_remote = self.control.buf[ 0:  4].cast('I')
+            self.full_dump_counter_remote      = self.control.buf[10: 14].cast('I')
         self.lock_pid_remote               = self.control.buf[ 4:  8]
         self.lock_remote                   = self.control.buf[ 8: 10]
-        self.full_dump_counter_remote      = self.control.buf[10: 14].cast('I')
-        if PYPY:
-            # The same two counters as bytes, see `changed()`
-            self.update_stream_position_bytes_remote = self.control.buf[ 0:  4]
-            self.full_dump_counter_bytes_remote      = self.control.buf[10: 14]
         self.full_dump_static_size_remote  = self.control.buf[14: 18]
         self.shared_lock_remote            = self.control.buf[18: 19]
         self.recurse_remote                = self.control.buf[19: 20]
@@ -909,29 +982,31 @@ class UltraDict(collections.UserDict, FastCore):
         #log.debug("Loading full dump local_counter={} remote_counter={}", self.full_dump_counter, full_dump_counter)
         try:
             if force or (self.full_dump_counter < full_dump_counter):
-                if self.full_dump_size and self.full_dump_memory:
-                    full_dump_memory = self.full_dump_memory
-                else:
+                dynamic = not (self.full_dump_size and self.full_dump_memory)
+                if dynamic:
                     # Retry if necessary
                     full_dump_memory = self.get_full_dump_memory()
+                else:
+                    full_dump_memory = self.full_dump_memory
 
-                buf = full_dump_memory.buf
+                try:
+                    buf = full_dump_memory.buf
 
-                # Read header, see FULL_DUMP_HEADER
-                start_marker, length, checksum, end_marker = FULL_DUMP_HEADER.unpack_from(buf, 0)
-                body = bytes(buf[FULL_DUMP_HEADER_SIZE:FULL_DUMP_HEADER_SIZE + length])
-                if start_marker != 0xFF or end_marker != 0xFF or length <= 0 \
-                        or zlib.crc32(body, full_dump_counter & 0xFFFFFFFF) != checksum:
-                    if sys.platform != 'win32' and not self.full_dump_memory:
+                    # Read header, see FULL_DUMP_HEADER
+                    start_marker, length, checksum, end_marker = FULL_DUMP_HEADER.unpack_from(buf, 0)
+                    body = bytes(buf[FULL_DUMP_HEADER_SIZE:FULL_DUMP_HEADER_SIZE + length])
+                    if start_marker != 0xFF or end_marker != 0xFF or length <= 0 \
+                            or zlib.crc32(body, full_dump_counter & 0xFFFFFFFF) != checksum:
+                        raise FullDumpMismatch()
+                    # Unserialize the full dump
+                    self.data = self.serializer.loads(body)
+                    self.full_dump_counter = full_dump_counter
+                    self.update_stream_position = 0
+                finally:
+                    # Close the dynamic full dump memory after reading it. Without this, PyPy keeps
+                    # the file descriptor open until its garbage collector runs.
+                    if dynamic and sys.platform != 'win32':
                         full_dump_memory.close()
-                    raise FullDumpMismatch()
-                # Unserialize the full dump
-                self.data = self.serializer.loads(body)
-                self.full_dump_counter = full_dump_counter
-                self.update_stream_position = 0
-
-                if sys.platform != 'win32' and not self.full_dump_memory:
-                    full_dump_memory.close()
             else:
                 raise Exception("Cannot load full dump, no new data available")
         except AssertionError as e:
@@ -963,7 +1038,7 @@ class UltraDict(collections.UserDict, FastCore):
         Returns the header marker byte and the serialized change.
         """
         if self.use_marshal and type(key) in MARSHAL_TYPES and type(item) in MARSHAL_TYPES:
-            return MARKER_MARSHAL, marshal.dumps((mode, key, item), MARSHAL_VERSION)
+            return MARKER_MARSHAL, marshal_dumps((mode, key, item), MARSHAL_VERSION)
         return MARKER_SERIALIZER, self.serializer.dumps((mode, key, item))
 
     #@profile
@@ -994,7 +1069,10 @@ class UltraDict(collections.UserDict, FastCore):
         # the last full dump yet, e.g. in append_update(). The lock keeps the shared counter stable.
         buf = self.buffer_remote
         checksum = zlib.crc32(marshalled, self.full_dump_counter_remote[0])
-        buf[start_position + HEADER_SIZE:end_position] = marshalled
+        if PYPY_CFFI:
+            ffi.memmove(self.buffer_pointer_remote + (start_position + HEADER_SIZE), marshalled, length)
+        else:
+            buf[start_position + HEADER_SIZE:end_position] = marshalled
         HEADER.pack_into(buf, start_position, marker, length, checksum, 0xFF)
 
         # Inform others about it, only after the full record is written
@@ -1049,8 +1127,7 @@ class UltraDict(collections.UserDict, FastCore):
         Returns True if a new full dump appeared while reading. The caller must then load it.
         Raises AssertionError on a bad record.
         """
-        remote_position = self.update_stream_position_remote
-        full_dump_counter_remote = self.full_dump_counter_remote
+        # Read the counters from `self` each time, never from local variables, see `init_remotes()`
 
         # Remember start position in the update stream
         pos = self.update_stream_position
@@ -1061,18 +1138,24 @@ class UltraDict(collections.UserDict, FastCore):
         loads = None
 
         # Iterate over all updates until the start of the last update
-        while pos < remote_position[0]:
+        while pos < self.update_stream_position_remote[0]:
             # Read header, it is a marker byte, 4 bytes of length and a FF byte
             marker, length, checksum, end_marker = HEADER.unpack_from(buf, pos)
             if end_marker != 0xFF:
                 raise AssertionError(f"Bad header in update stream at position {pos}")
             pos += HEADER_SIZE
+            # The cffi copy below does not check the bounds of the buffer
+            if length > self.buffer_size - pos:
+                raise AssertionError(f"Bad length in update stream at position {pos - HEADER_SIZE}")
             #log.debug("Found update, update_stream_position={} length={}", self.update_stream_position, length + 6)
 
             # Copy the record, then check that no new full dump appeared meanwhile.
             # Writers only overwrite the stream after a new full dump, so the copy is valid.
-            record = bytes(buf[pos:pos+length])
-            if self.full_dump_counter != full_dump_counter_remote[0]:
+            if PYPY_CFFI:
+                record = ffi.unpack(self.buffer_pointer_remote + pos, length)
+            else:
+                record = bytes(buf[pos:pos+length])
+            if self.full_dump_counter != self.full_dump_counter_remote[0]:
                 return True
 
             # Never parse a record that is not complete, see HEADER
@@ -1175,31 +1258,16 @@ class UltraDict(collections.UserDict, FastCore):
     else:
         replay_stream = replay_stream_python
 
-        if PYPY:
-            def changed(self):
-                """
-                True if the stream position or the full dump counter differ from ours.
-                Also True after `close()`, then `apply_update()` raises AlreadyClosed.
-
-                On PyPy, `int.from_bytes()` is faster than an index into a cast memoryview.
-                The counters use the native byte order, see `init_remotes()`.
-                """
-                try:
-                    return self.update_stream_position != int.from_bytes(self.update_stream_position_bytes_remote, sys.byteorder) \
-                        or self.full_dump_counter != int.from_bytes(self.full_dump_counter_bytes_remote, sys.byteorder)
-                except AttributeError:
-                    return True
-        else:
-            def changed(self):
-                """
-                True if the stream position or the full dump counter differ from ours.
-                Also True after `close()`, then `apply_update()` raises AlreadyClosed.
-                """
-                try:
-                    return self.update_stream_position != self.update_stream_position_remote[0] \
-                        or self.full_dump_counter != self.full_dump_counter_remote[0]
-                except AttributeError:
-                    return True
+        def changed(self):
+            """
+            True if the stream position or the full dump counter differ from ours.
+            Also True after `close()`, then `apply_update()` raises AlreadyClosed.
+            """
+            try:
+                return self.update_stream_position != self.update_stream_position_remote[0] \
+                    or self.full_dump_counter != self.full_dump_counter_remote[0]
+            except AttributeError:
+                return True
 
         def __delitem__(self, key):
             #log.debug("__delitem__ {}", key)
@@ -1232,7 +1300,7 @@ class UltraDict(collections.UserDict, FastCore):
             try:
                 if self.use_marshal and type(key) in MARSHAL_TYPES and type(item) in MARSHAL_TYPES:
                     marker = MARKER_MARSHAL
-                    marshalled = marshal.dumps((True, key, item), MARSHAL_VERSION)
+                    marshalled = marshal_dumps((True, key, item), MARSHAL_VERSION)
                 else:
                     marker = MARKER_SERIALIZER
                     marshalled = self.serializer.dumps((True, key, item))

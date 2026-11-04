@@ -124,9 +124,9 @@ Check which implementation is active:
 True
 ```
 
-On PyPy and other implementations than CPython, UltraDict uses the pure Python implementation, because the C extension uses CPython internals. PyPy's JIT compiler makes the pure Python implementation fast there.
+The C extension uses CPython internals, so PyPy does not use it. On PyPy, UltraDict uses cffi, which is part of PyPy, to read and write the shared memory. PyPy's JIT compiler turns these reads and writes into plain machine loads and stores. PyPy needs no build step for this, and `UltraDict.accelerated` is `False` there. Other Python implementations use the pure Python implementation.
 
-Set the environment variable `ULTRADICT_PURE_PYTHON=1` to use the pure Python implementation. Processes with and without the C extension can share the same UltraDict.
+Set the environment variable `ULTRADICT_PURE_PYTHON=1` to use the pure Python implementation, on CPython and on PyPy. Processes with and without the C extension or cffi can share the same UltraDict. CPython and PyPy processes can also share the same UltraDict.
 
 With the C extension, `shared_lock=True` does not need the `atomics` package.
 
@@ -148,6 +148,17 @@ Time per operation on Python 3.13, Linux x86_64, with simple keys and values and
 | Write `u[1] = 1` | 1,866 ns | 852 ns | 264 ns |
 | Write, then read in a second instance | 3,952 ns | 2,105 ns | 623 ns |
 | Write with `shared_lock=True` | 14,031 ns | 2,126 ns | 161 ns |
+
+Time per operation on PyPy 3.11, Linux x86_64, with the same keys, values and `buffer_size`:
+
+| Operation | Before cffi | cffi |
+|---|---|---|
+| Read `u[1]` | 34 ns | 4.4 ns |
+| Read `u.get(1)` | 34 ns | 4.4 ns |
+| `1 in u` | 36 ns | 4.4 ns |
+| Write `u[1] = 1` | 1,202 ns | 233 ns |
+| Write, then read in a second instance | 1,727 ns | 794 ns |
+| Write with `shared_lock=True` | Fails, see the bug fixes below | 266 ns |
 
 With the default `buffer_size` of 10,000 bytes, a full dump happens every few hundred small writes. A bigger `buffer_size`, e.g. `1_000_000`, makes full dumps rarer and writes faster.
 
@@ -458,7 +469,7 @@ Other things you can do:
 
 Contributions are always welcome!
 
-Run the tests with and without the C extension:
+Run the tests with and without the C extension. On PyPy, skip the build step. The tests then run with cffi and without it.
 
 ```bash
 python setup.py build_ext --inplace
@@ -475,4 +486,5 @@ These bug fixes change the behavior of the original implementation:
 * Deleting a key works with every serializer. Delete records now use `None` as their value. Before, they used `b''`, which a JSON serializer cannot write.
 * A reader ignores a delete in the stream for a key that its local copy does not have. Before, it raised `KeyError`, e.g. after another process changed its local copy with `|=`, which does not stream the change, or when two threads read through the same UltraDict.
 * `shared_lock=True` works on PyPy. Before, the `exchange()` of the `atomics` package returned a wrong value there, so a lock could not be released.
+* A process closes each full dump that it loads from another process, also after it made a full dump itself. Before, such a process kept the full dump memory open until the garbage collector freed it. On PyPy, many full dumps used up all file descriptors.
 * Only the UltraDict that created the recurse register unlinks the nested UltraDicts when it closes. Before, an UltraDict that only used the register of another UltraDict (`recurse_register`), or a nested UltraDict on `unlink()`, unlinked the whole tree. The owner then failed to close with `CannotAttachSharedMemory`.

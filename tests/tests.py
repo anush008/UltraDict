@@ -14,6 +14,10 @@ if hasattr(UltraDict.log, 'disable'):
 else:
     UltraDict.log.set_level(UltraDict.log.Levels.error)
 
+# True if a faster path than pure Python is used: the C extension on CPython, cffi on PyPy
+MODULE = sys.modules['UltraDict.UltraDict']
+FAST = MODULE.ACCELERATED or MODULE.PYPY_CFFI
+
 # Retry budget in seconds for tests that simulate a writer whose data arrives late
 SLOW_RETRY_DELAYS = (0, 0.001, 0.01, 0.1, 0.5, 1, 2, 5)
 
@@ -190,6 +194,52 @@ class UltraDictTests(unittest.TestCase):
                 del expected[key]
                 self.assertNotIn(key, by_key_other)
         self.assertEqual(len(by_key_other), 0)
+
+    def test_marshal_dumps_simple(self):
+        # The marshal encoder for PyPy must give the same changes as marshal.dumps() on every Python
+        import marshal, math
+        values = [
+            0, 1, -1, 2**31 - 1, -2**31, 2**31, -2**31 - 1, 2**200,
+            0.0, -0.0, 1.5, 5e-324, float('inf'), float('nan'),
+            '', 'a', 'x' * 300, 'ä€😀', '\udcff', 'a\x00b', b'', b'\x00' * 300, True, False, None,
+        ]
+        for mode in (True, False):
+            for key in values:
+                for item in values:
+                    change = (mode, key, item)
+                    got = marshal.loads(MODULE.marshal_dumps_simple(change))
+                    expected = marshal.loads(marshal.dumps(change, MODULE.MARSHAL_VERSION))
+                    self.assertEqual([type(v) for v in got], [type(v) for v in expected], change)
+                    self.assertEqual(repr(got), repr(expected), change)
+                    for g, e in zip(got, expected):
+                        if isinstance(e, float) and not math.isnan(e):
+                            self.assertEqual(math.copysign(1, g), math.copysign(1, e), change)
+
+    @unittest.skipIf(sys.platform == 'win32', "Windows keeps the dynamic full dump memory open")
+    def test_loaded_full_dump_is_closed(self):
+        # A process that has made a full dump itself must still close the full dumps that it loads
+        # from other processes. PyPy closes an unreferenced SharedMemory only when its garbage
+        # collector runs, so each load kept a file descriptor open.
+        writer = UltraDict(buffer_size=10_000)
+        loader = UltraDict(name=writer.name)
+        loader['own'] = 1
+        loader.dump()
+        opened = []
+        original = loader.get_full_dump_memory
+        def get_full_dump_memory(*args, **kwargs):
+            memory = original(*args, **kwargs)
+            opened.append(memory)
+            return memory
+        with mock.patch.object(loader, 'get_full_dump_memory', get_full_dump_memory):
+            for i in range(3):
+                writer['i'] = i
+                writer.dump()
+                self.assertEqual(loader['i'], i)
+        self.assertEqual(len(opened), 3)
+        for memory in opened:
+            with self.assertRaises((TypeError, ValueError, AttributeError)):
+                memory.buf[0]
+        writer.unlink()
 
     def test_record_visible_later(self):
         # On CPUs with weak memory order, a reader can see the new stream position before the
@@ -518,9 +568,9 @@ class UltraDictTests(unittest.TestCase):
         self.assertNotIn(b'FAIL', ret.stdout, self.exec_show_output(ret))
 
     def modes(self):
-        """ Environments for the modes to test: always pure Python, and the C extension if it is built """
+        """ Environments for the modes to test: always pure Python, and the fast path if it is used, see FAST """
         pure = dict(os.environ, ULTRADICT_PURE_PYTHON='1')
-        if UltraDict.accelerated:
+        if FAST:
             accelerated = dict(os.environ)
             accelerated.pop('ULTRADICT_PURE_PYTHON', None)
             return {'pure': pure, 'accelerated': accelerated}
@@ -571,7 +621,8 @@ class UltraDictTests(unittest.TestCase):
             "    with d.lock:\n"
             "        d['counter'] += 1\n"
             "del d[0]\n"
-            "print(UltraDict.accelerated)\n"
+            "module = sys.modules['UltraDict.UltraDict']\n"
+            "print(module.ACCELERATED or module.PYPY_CFFI)\n"
         )
         for mode, env in self.modes().items():
             with self.subTest(mode=mode):
