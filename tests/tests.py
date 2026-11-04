@@ -214,6 +214,11 @@ class UltraDictTests(unittest.TestCase):
                     for g, e in zip(got, expected):
                         if isinstance(e, float) and not math.isnan(e):
                             self.assertEqual(math.copysign(1, g), math.copysign(1, e), change)
+                    # The decoder for PyPy reads what both encoders write
+                    for encoded in (MODULE.marshal_dumps_simple(change), marshal.dumps(change, MODULE.MARSHAL_VERSION)):
+                        got = MODULE.marshal_loads_simple(encoded)
+                        self.assertEqual([type(v) for v in got], [type(v) for v in expected], change)
+                        self.assertEqual(repr(got), repr(expected), change)
 
     def test_full_dump_memory_is_reused_and_closed(self):
         # A full dump that fits goes into the same dynamic full dump memory
@@ -268,6 +273,19 @@ class UltraDictTests(unittest.TestCase):
         self.assertNotIn(0, seen)
         self.assertNotIn('bad', seen)
         ultra.unlink()
+
+    @unittest.skipUnless(MODULE.ACCELERATED, "needs the C extension")
+    def test_crc32_of_the_c_extension(self):
+        # The C extension and zlib must give the same CRC32, so processes with and without the
+        # C extension can share an UltraDict
+        import random, zlib
+        from UltraDict import _fast
+        rnd = random.Random(1)
+        for length in list(range(70)) + [255, 256, 1000, 4097, 100_003]:
+            for _ in range(5):
+                data = rnd.randbytes(length)
+                seed = rnd.getrandbits(32)
+                self.assertEqual(_fast.crc32(data, seed), zlib.crc32(data, seed), (length, seed))
 
     def test_record_visible_later(self):
         # On CPUs with weak memory order, a reader can see the new stream position before the

@@ -37,6 +37,10 @@ from libc.stdint cimport uint32_t, uint64_t, int32_t
 
 cdef extern from "Python.h":
     bint PyUnicode_IS_ASCII(object o)
+    double PyFloat_Unpack8(const char *p, int le) except? -1.0
+    object PyUnicode_DecodeUTF8(const char *s, Py_ssize_t size, const char *errors)
+    object PyUnicode_DecodeLatin1(const char *s, Py_ssize_t size, const char *errors)
+    object PyLong_FromLong(long v)
     void *PyUnicode_DATA(object o)
     Py_ssize_t PyUnicode_GET_LENGTH(object o)
     const char *PyUnicode_AsUTF8AndSize(object o, Py_ssize_t *size) except NULL
@@ -63,6 +67,11 @@ cdef extern from "_fast_atomic.h":
 VERSION = 3
 
 ud_crc32_init()
+
+def crc32(data, seed=0):
+    """ Same result as `zlib.crc32(data, seed)`. Only for the tests, see tests/tests.py. """
+    cdef const unsigned char[::1] view = data
+    return ud_crc32(<uint32_t>seed, &view[0] if view.shape[0] else NULL, <size_t>view.shape[0])
 
 def fence():
     """
@@ -113,6 +122,11 @@ cdef enum:
     M_ASCII = 0x61        # 'a'
     M_UNICODE = 0x75      # 'u'
     M_STRING = 0x73       # 's'
+    # Only read by `read_simple()`, marshal.dumps() of CPython writes them
+    M_SHORT_ASCII_INTERNED = 0x5A  # 'Z'
+    M_ASCII_INTERNED = 0x41        # 'A'
+    # Marks an object that later references can use. Simple records have no references.
+    M_FLAG_REF = 0x80
 
 cdef Py_ssize_t marshal_size(object o):
     """
@@ -196,6 +210,73 @@ cdef unsigned char *marshal_write(object o, unsigned char *p) except NULL:
     write_u32_le(p + 1, <uint32_t>n)
     memcpy(p + 5, PyBytes_AS_STRING(o), n)
     return p + 5 + n
+
+# Returned by `read_simple()` for an object that it cannot read
+cdef object NOT_SIMPLE = object()
+
+cdef object read_simple(const unsigned char **pp, const unsigned char *end):
+    """
+    Read one object of a simple type in the marshal format at `pp[0]` and move `pp[0]` after it.
+    Returns NOT_SIMPLE for other objects and for incomplete data. Reads all forms that
+    `marshal_write()` and `marshal.dumps()` write for the simple types, see `is_simple()`.
+    """
+    cdef const unsigned char *p = pp[0]
+    cdef size_t available = <size_t>(end - p)
+    cdef size_t n
+    cdef unsigned char code
+    if available < 1:
+        return NOT_SIMPLE
+    code = p[0] & ~M_FLAG_REF
+    if code == M_INT:
+        if available < 5:
+            return NOT_SIMPLE
+        pp[0] = p + 5
+        return PyLong_FromLong(<int32_t>read_u32_le(p + 1))
+    if code == M_SHORT_ASCII or code == M_SHORT_ASCII_INTERNED:
+        if available < 2:
+            return NOT_SIMPLE
+        n = p[1]
+        if n > available - 2:
+            return NOT_SIMPLE
+        pp[0] = p + 2 + n
+        # Same as marshal, which reads these bytes as Latin-1
+        return PyUnicode_DecodeLatin1(<const char *>p + 2, n, NULL)
+    if code == M_TRUE or code == M_FALSE or code == M_NONE:
+        pp[0] = p + 1
+        return True if code == M_TRUE else False if code == M_FALSE else None
+    if code == M_BINARY_FLOAT:
+        if available < 9:
+            return NOT_SIMPLE
+        pp[0] = p + 9
+        return PyFloat_Unpack8(<const char *>p + 1, 1)
+    if code == M_ASCII or code == M_ASCII_INTERNED or code == M_UNICODE or code == M_STRING:
+        if available < 5:
+            return NOT_SIMPLE
+        n = read_u32_le(p + 1)
+        if n > available - 5:
+            return NOT_SIMPLE
+        pp[0] = p + 5 + n
+        if code == M_UNICODE:
+            return PyUnicode_DecodeUTF8(<const char *>p + 5, n, "surrogatepass")
+        if code == M_STRING:
+            return PyBytes_FromStringAndSize(<const char *>p + 5, n)
+        return PyUnicode_DecodeLatin1(<const char *>p + 5, n, NULL)
+    return NOT_SIMPLE
+
+cdef inline int simple_change_mode(const unsigned char *p, size_t length) noexcept:
+    """
+    For a change `(mode, key, value)` in the marshal format, return 1 if the mode is True
+    and 0 if it is False. Return -1 for other data. `read_simple()` then reads key and value.
+    """
+    cdef unsigned char code
+    if length < 5 or (p[0] & ~M_FLAG_REF) != M_SMALL_TUPLE or p[1] != 3:
+        return -1
+    code = p[2] & ~M_FLAG_REF
+    if code == M_TRUE:
+        return 1
+    if code == M_FALSE:
+        return 0
+    return -1
 
 cdef raise_no_attribute(object obj, str name):
     raise AttributeError(f"'{type(obj).__name__}' object has no attribute '{name}'")
@@ -599,6 +680,9 @@ cdef class FastCore(dict):
         cdef unsigned char marker
         cdef uint32_t counter, checksum, actual
         cdef char local_record[STACK_RECORD_SIZE]
+        cdef const unsigned char *body
+        cdef const unsigned char *q
+        cdef int simple_mode
 
         data = self.get_data()
         loads = None
@@ -648,10 +732,21 @@ cdef class FastCore(dict):
 
             # Unserialize the update data, we expect a tuple of mode, key and value
             if marker == MARKER_MARSHAL:
-                if record is None:
-                    mode, key, value = PyMarshal_ReadObjectFromString(local_record, length)
+                body = <const unsigned char *>local_record if record is None else <const unsigned char *>PyBytes_AS_STRING(record)
+                # Simple types are read directly, which is much faster than marshal
+                simple_mode = simple_change_mode(body, length)
+                value = NOT_SIMPLE
+                if simple_mode >= 0:
+                    q = body + 3
+                    key = read_simple(&q, body + length)
+                    if key is not NOT_SIMPLE:
+                        value = read_simple(&q, body + length)
+                        if q != body + length:
+                            value = NOT_SIMPLE
+                if value is NOT_SIMPLE:
+                    mode, key, value = PyMarshal_ReadObjectFromString(<const char *>body, length)
                 else:
-                    mode, key, value = PyMarshal_ReadObjectFromString(PyBytes_AS_STRING(record), length)
+                    mode = simple_mode == 1
             elif marker == MARKER_SERIALIZER:
                 if loads is None:
                     loads = self.serializer.loads
@@ -660,7 +755,12 @@ cdef class FastCore(dict):
                 raise AssertionError(f"Bad header in update stream at position {pos}")
 
             # A delete can be applied twice when two threads read through the same UltraDict
-            if mode:
+            if type(data) is dict:
+                if mode:
+                    (<dict>data)[key] = value
+                else:
+                    (<dict>data).pop(key, None)
+            elif mode:
                 data[key] = value
             else:
                 data.pop(key, None)
