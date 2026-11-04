@@ -9,7 +9,7 @@ Features:
 * No running manager processes
 * Works in spawn and fork context
 * Safe locking between independent processes
-* Tested with Python >= 3.11 on Linux, Windows and Mac
+* Tested with Python >= 3.11 and PyPy 3.11 on Linux, Windows and Mac
 * Convenient, no setter or getters necessary
 * Optional recursion for nested dicts
 
@@ -123,6 +123,8 @@ Check which implementation is active:
 >>> UltraDict.accelerated
 True
 ```
+
+On PyPy and other implementations than CPython, UltraDict uses the pure Python implementation, because the C extension uses CPython internals. PyPy's JIT compiler makes the pure Python implementation fast there.
 
 Set the environment variable `ULTRADICT_PURE_PYTHON=1` to use the pure Python implementation. Processes with and without the C extension can share the same UltraDict.
 
@@ -472,4 +474,5 @@ These bug fixes change the behavior of the original implementation:
 * `UltraDict.SharedLock.reset()` releases the lock. Before, it always raised `ValueError`.
 * Deleting a key works with every serializer. Delete records now use `None` as their value. Before, they used `b''`, which a JSON serializer cannot write.
 * A reader ignores a delete in the stream for a key that its local copy does not have. Before, it raised `KeyError`, e.g. after another process changed its local copy with `|=`, which does not stream the change, or when two threads read through the same UltraDict.
+* `shared_lock=True` works on PyPy. Before, the `exchange()` of the `atomics` package returned a wrong value there, so a lock could not be released.
 * Only the UltraDict that created the recurse register unlinks the nested UltraDicts when it closes. Before, an UltraDict that only used the register of another UltraDict (`recurse_register`), or a nested UltraDict on `unlink()`, unlinked the whole tree. The owner then failed to close with `CannotAttachSharedMemory`.

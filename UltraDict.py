@@ -102,10 +102,12 @@ MARSHAL_VERSION = 4
 # None works with every serializer, e.g. also with JSON.
 DELETED = None
 
-# Optional C implementation of the hot paths, see _fast.pyx.
+# Optional C implementation of the hot paths, see _fast.pyx. It uses CPython internals,
+# so other implementations like PyPy use the pure Python implementation.
 # Set the environment variable ULTRADICT_PURE_PYTHON=1 to disable it.
 ACCELERATED = False
-if not os.environ.get('ULTRADICT_PURE_PYTHON'):
+PYPY = sys.implementation.name == 'pypy'
+if not os.environ.get('ULTRADICT_PURE_PYTHON') and sys.implementation.name == 'cpython':
     try:
         from . import _fast
         if getattr(_fast, 'VERSION', None) == 3:
@@ -339,8 +341,15 @@ class UltraDict(collections.UserDict, FastCore):
                     raise Exceptions.CannotAcquireLock(blocking_pid=self.get_remote_pid())
 
         def exchange_public_api(self, desired):
-            """ Slow fallback for `exchange()` if `make_fast_exchange()` cannot be used """
-            return self.lock_atomic.exchange(b'\x01' if desired else b'\x00')[0]
+            """
+            Slow fallback for `exchange()` if `make_fast_exchange()` cannot be used.
+
+            Uses `cmpxchg_strong()` because `exchange()` of atomics returns a wrong old value on
+            PyPy. The lock byte is always 0 or 1, so a compare and swap gives the same result.
+            """
+            if desired:
+                return 0 if self.lock_atomic.cmpxchg_strong(expected=b'\x00', desired=b'\x01').success else 1
+            return 1 if self.lock_atomic.cmpxchg_strong(expected=b'\x01', desired=b'\x00').success else 0
 
         if not ACCELERATED:
             # With the C extension, SharedLockCore provides these methods
@@ -519,7 +528,8 @@ class UltraDict(collections.UserDict, FastCore):
     CORE_ATTRS = 'data', 'update_stream_position', 'full_dump_counter', 'buffer_size', \
         'serializer', 'recurse', 'fast_lock', 'use_marshal'
 
-    __slots__ = python_attrs(STATUS_ATTRS + ('fast_lock', 'use_marshal', 'buffer_remote'), CORE_ATTRS)
+    __slots__ = python_attrs(STATUS_ATTRS + ('fast_lock', 'use_marshal', 'buffer_remote',
+        'update_stream_position_bytes_remote', 'full_dump_counter_bytes_remote'), CORE_ATTRS)
 
     # True if the C extension module `_fast` is used
     accelerated = ACCELERATED
@@ -718,6 +728,10 @@ class UltraDict(collections.UserDict, FastCore):
         self.lock_pid_remote               = self.control.buf[ 4:  8]
         self.lock_remote                   = self.control.buf[ 8: 10]
         self.full_dump_counter_remote      = self.control.buf[10: 14].cast('I')
+        if PYPY:
+            # The same two counters as bytes, see `changed()`
+            self.update_stream_position_bytes_remote = self.control.buf[ 0:  4]
+            self.full_dump_counter_bytes_remote      = self.control.buf[10: 14]
         self.full_dump_static_size_remote  = self.control.buf[14: 18]
         self.shared_lock_remote            = self.control.buf[18: 19]
         self.recurse_remote                = self.control.buf[19: 20]
@@ -1161,16 +1175,31 @@ class UltraDict(collections.UserDict, FastCore):
     else:
         replay_stream = replay_stream_python
 
-        def changed(self):
-            """
-            True if the stream position or the full dump counter differ from ours.
-            Also True after `close()`, then `apply_update()` raises AlreadyClosed.
-            """
-            try:
-                return self.update_stream_position != self.update_stream_position_remote[0] \
-                    or self.full_dump_counter != self.full_dump_counter_remote[0]
-            except AttributeError:
-                return True
+        if PYPY:
+            def changed(self):
+                """
+                True if the stream position or the full dump counter differ from ours.
+                Also True after `close()`, then `apply_update()` raises AlreadyClosed.
+
+                On PyPy, `int.from_bytes()` is faster than an index into a cast memoryview.
+                The counters use the native byte order, see `init_remotes()`.
+                """
+                try:
+                    return self.update_stream_position != int.from_bytes(self.update_stream_position_bytes_remote, sys.byteorder) \
+                        or self.full_dump_counter != int.from_bytes(self.full_dump_counter_bytes_remote, sys.byteorder)
+                except AttributeError:
+                    return True
+        else:
+            def changed(self):
+                """
+                True if the stream position or the full dump counter differ from ours.
+                Also True after `close()`, then `apply_update()` raises AlreadyClosed.
+                """
+                try:
+                    return self.update_stream_position != self.update_stream_position_remote[0] \
+                        or self.full_dump_counter != self.full_dump_counter_remote[0]
+                except AttributeError:
+                    return True
 
         def __delitem__(self, key):
             #log.debug("__delitem__ {}", key)

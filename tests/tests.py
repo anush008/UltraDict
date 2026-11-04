@@ -518,8 +518,11 @@ class UltraDictTests(unittest.TestCase):
         # tests/api_check_expected.txt is the output of tests/api_check.py with the original
         # implementation of UltraDict, plus the bug fixes listed in readme.md. Every other step
         # of the API must still behave the same.
-        # Pickle on Python 3.14 raises PicklingError for a lambda, earlier versions AttributeError
-        if sys.version_info >= (3, 14):
+        # Pickle on Python 3.14 raises PicklingError for a lambda, earlier versions AttributeError.
+        # PyPy frees objects only when its garbage collector runs and has a pure Python json encoder.
+        if sys.implementation.name == 'pypy':
+            expected_file = 'tests/api_check_expected_pypy.txt'
+        elif sys.version_info >= (3, 14):
             expected_file = 'tests/api_check_expected_py314.txt'
         else:
             expected_file = 'tests/api_check_expected.txt'
@@ -603,13 +606,17 @@ class UltraDictTests(unittest.TestCase):
             return len([f for f in p.open_files() if f.path not in baseline])
 
         self.assertEqual(count(), 0, "file handle count before before tests should be 0")
+        # PyPy frees objects only when its garbage collector runs
+        import gc
         ultra = UltraDict(nested={ 1: 1})
         self.assertEqual(count(), 4, "file handle count with one simple UltraDict should be 4")
         del ultra
+        gc.collect()
         self.assertEqual(count(), 0, "file handle count after deleting the UltraDict should be 0 again")
         ultra = UltraDict(nested={ 1: 1}, recurse=True)
         self.assertEqual(count(), 12, "nested file handle count should be 12")
         del ultra
+        gc.collect()
         self.assertEqual(count(), 0, "nested file handle count after deleting UltraDict should be 0 again")
 
     def test_example_simple(self):

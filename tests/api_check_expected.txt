@@ -225,7 +225,7 @@ recurse children alive before creator close: [bool:True, bool:True]
 recurse register alive before creator close: bool:True
 recurse nested unlink: (bool:True, bool:True)
 recurse attacher close: {str:'nested': UltraDict({str:'counter': int:1, str:'deeper': UltraDict({str:'x': int:2})}), str:'list': [int:1, {str:'a': int:1}]}
-recurse creator close: raises AttributeError
+recurse creator close: {str:'nested': UltraDict({str:'counter': int:1, str:'deeper': UltraDict(closed)}), str:'list': [int:1, {str:'a': int:1}]}
 recurse children unlinked: [bool:False, bool:False]
 
 ## auto_unlink and close

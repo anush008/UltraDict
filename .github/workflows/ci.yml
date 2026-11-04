@@ -43,6 +43,18 @@ jobs:
             arch: x86
         # Run in all these versions of Python
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        # PyPy uses the pure Python implementation. PyPy has no 32 bit Windows build.
+        include:
+          - config: { name: "linux-x86_64", os: ubuntu-24.04, arch: x64 }
+            python-version: "pypy3.11"
+          - config: { name: "linux-aarch64", os: ubuntu-24.04-arm, arch: arm64 }
+            python-version: "pypy3.11"
+          - config: { name: "macos-x86_64", os: macos-15-intel, arch: x64 }
+            python-version: "pypy3.11"
+          - config: { name: "macos-arm64", os: macos-15, arch: arm64 }
+            python-version: "pypy3.11"
+          - config: { name: "win-amd64", os: windows-2025, arch: x64 }
+            python-version: "pypy3.11"
     steps:
       - uses: actions/checkout@v7
       - name: Install Python ${{ matrix.python-version }}
@@ -69,14 +81,14 @@ jobs:
         env:
           ULTRADICT_PURE_PYTHON: 1
       - name: Build the C extension
-        # Also test the C extension when the tests without it fail
-        if: success() || failure()
+        # Also test the C extension when the tests without it fail. It needs CPython.
+        if: (success() || failure()) && !startsWith(matrix.python-version, 'pypy')
         run: |
           pip install cython setuptools
           cythonize -3 -i _fast.pyx
           python -c "import sys; sys.path.insert(0, '..'); from UltraDict import UltraDict; assert UltraDict.accelerated"
       - name: Run unit tests with the C extension
-        if: success() || failure()
+        if: (success() || failure()) && !startsWith(matrix.python-version, 'pypy')
         run: python -m unittest
           #- name: Run pylint
           #run: pylint UltraDict.py
