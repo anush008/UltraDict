@@ -181,6 +181,60 @@ def marshal_dumps_simple(change, version=MARSHAL_VERSION):
 # `marshal.dumps()` of CPython is fast already
 marshal_dumps = marshal_dumps_simple if PYPY else marshal.dumps
 
+# Returned by `marshal_read_simple()` for a value that it cannot read
+NOT_SIMPLE = object()
+
+def marshal_read_simple(record, pos):
+    """
+    Read one value of a type in MARSHAL_TYPES in the marshal format at `pos` of `record`.
+    Returns the value and the position after it, or NOT_SIMPLE and 0 for other values.
+    Reads all forms that `marshal_simple()`, `marshal.dumps()` and the C extension write.
+    """
+    # The high bit marks a value that later references can use. Changes have no references.
+    code = record[pos] & 0x7F
+    if code == 0x69:  # 'i'
+        return MARSHAL_INT32.unpack_from(record, pos + 1)[0], pos + 5
+    if code == 0x7A or code == 0x5A:  # 'z' and 'Z', short ASCII
+        end = pos + 2 + record[pos + 1]
+        # Same as marshal, which reads these bytes as Latin-1
+        return record[pos + 2:end].decode('latin-1'), end
+    if code == 0x75 or code == 0x73 or code == 0x61 or code == 0x41:  # 'u', 's', 'a' and 'A'
+        end = pos + 5 + MARSHAL_UINT32.unpack_from(record, pos + 1)[0]
+        if code == 0x75:
+            return record[pos + 5:end].decode('utf-8', 'surrogatepass'), end
+        if code == 0x73:
+            return record[pos + 5:end], end
+        return record[pos + 5:end].decode('latin-1'), end
+    if code == 0x54:  # 'T'
+        return True, pos + 1
+    if code == 0x46:  # 'F'
+        return False, pos + 1
+    if code == 0x4E:  # 'N'
+        return None, pos + 1
+    if code == 0x67:  # 'g'
+        return MARSHAL_FLOAT.unpack_from(record, pos + 1)[0], pos + 9
+    return NOT_SIMPLE, 0
+
+def marshal_loads_simple(record):
+    """
+    Same result as `marshal.loads(record)` for a change `(mode, key, item)`.
+
+    On PyPy, `marshal.loads()` is slow, and the JIT compiles this function to much faster
+    code. Changes with other types than MARSHAL_TYPES use `marshal.loads()`.
+    """
+    if len(record) >= 5 and record[0] & 0x7F == 0x29 and record[1] == 3:  # A tuple of 3 items
+        mode = record[2] & 0x7F
+        if mode == 0x54 or mode == 0x46:  # 'T' or 'F'
+            key, pos = marshal_read_simple(record, 3)
+            if key is not NOT_SIMPLE and pos <= len(record):
+                item, pos = marshal_read_simple(record, pos)
+                if item is not NOT_SIMPLE and pos == len(record):
+                    return mode == 0x54, key, item
+    return marshal.loads(record)
+
+# `marshal.loads()` of CPython is fast already
+marshal_loads = marshal_loads_simple if PYPY else marshal.loads
+
 if ACCELERATED:
     FastCore = _fast.FastCore
     SharedLockCore = _fast.SharedLockCore
@@ -1214,7 +1268,7 @@ class UltraDict(collections.UserDict, FastCore):
 
         # Unserialize the update data, we expect a tuple of mode, key and value
         if marker == MARKER_MARSHAL:
-            mode, key, value = marshal.loads(record)
+            mode, key, value = marshal_loads(record)
         elif marker == MARKER_SERIALIZER:
             mode, key, value = self.serializer.loads(record)
         else:

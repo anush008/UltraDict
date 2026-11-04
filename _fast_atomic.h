@@ -85,8 +85,12 @@ static inline int ud_cmpxchg_u32(uint32_t *p, uint32_t expected, uint32_t desire
 /*
  * CRC32 of stream records, the same as zlib.crc32(data, seed) in Python.
  * Call ud_crc32_init() once before the first ud_crc32().
+ *
+ * Slicing by 8: table k gives the CRC of a byte followed by k zero bytes, so each step of
+ * the main loop handles 8 bytes. A table for one byte at a time is several times slower,
+ * because each step must wait for the result of the step before.
  */
-static uint32_t ud_crc32_table[256];
+static uint32_t ud_crc32_table[8][256];
 
 static void ud_crc32_init(void) {
     uint32_t i, k, c;
@@ -95,14 +99,33 @@ static void ud_crc32_init(void) {
         for (k = 0; k < 8; k++) {
             c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
         }
-        ud_crc32_table[i] = c;
+        ud_crc32_table[0][i] = c;
+    }
+    for (i = 0; i < 256; i++) {
+        c = ud_crc32_table[0][i];
+        for (k = 1; k < 8; k++) {
+            c = ud_crc32_table[0][c & 0xFF] ^ (c >> 8);
+            ud_crc32_table[k][i] = c;
+        }
     }
 }
 
 static uint32_t ud_crc32(uint32_t seed, const unsigned char *p, size_t n) {
     uint32_t crc = ~seed;
+    uint32_t low, high;
+    while (n >= 8) {
+        /* Read the bytes one by one, so the result does not depend on alignment or byte order */
+        low = crc ^ ((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+        high = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+        crc = ud_crc32_table[7][low & 0xFF] ^ ud_crc32_table[6][(low >> 8) & 0xFF]
+            ^ ud_crc32_table[5][(low >> 16) & 0xFF] ^ ud_crc32_table[4][low >> 24]
+            ^ ud_crc32_table[3][high & 0xFF] ^ ud_crc32_table[2][(high >> 8) & 0xFF]
+            ^ ud_crc32_table[1][(high >> 16) & 0xFF] ^ ud_crc32_table[0][high >> 24];
+        p += 8;
+        n -= 8;
+    }
     while (n--) {
-        crc = ud_crc32_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+        crc = ud_crc32_table[0][(crc ^ *p++) & 0xFF] ^ (crc >> 8);
     }
     return ~crc;
 }
