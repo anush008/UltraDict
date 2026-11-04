@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 import subprocess
 import sys
 import os
@@ -12,6 +13,9 @@ if hasattr(UltraDict.log, 'disable'):
     UltraDict.log.disable(UltraDict.log.CRITICAL)
 else:
     UltraDict.log.set_level(UltraDict.log.Levels.error)
+
+# Retry budget in seconds for tests that simulate a writer whose data arrives late
+SLOW_RETRY_DELAYS = (0, 0.001, 0.01, 0.1, 0.5, 1, 2, 5)
 
 class UltraDictTests(unittest.TestCase):
 
@@ -214,7 +218,10 @@ class UltraDictTests(unittest.TestCase):
         writer = threading.Thread(target=write_record)
         writer.start()
         try:
-            self.assertEqual(other['late'], 2)
+            # The simulated delay is much longer than a real one, and a busy CI machine can make
+            # it longer still, so give the reader a longer retry budget than the default
+            with mock.patch.object(module, 'RECORD_RETRY_DELAYS', SLOW_RETRY_DELAYS):
+                self.assertEqual(other['late'], 2)
         finally:
             writer.join()
 
@@ -245,7 +252,9 @@ class UltraDictTests(unittest.TestCase):
         writer = threading.Thread(target=publish_name)
         writer.start()
         try:
-            self.assertEqual(other['a'], 2)
+            # See test_record_visible_later
+            with mock.patch.object(module, 'RECORD_RETRY_DELAYS', SLOW_RETRY_DELAYS):
+                self.assertEqual(other['a'], 2)
         finally:
             writer.join()
             memory.close()
