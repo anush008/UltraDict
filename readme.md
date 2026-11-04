@@ -20,19 +20,25 @@ Features:
 
 ## Installation
 
-Install UltraDict from the source on GitHub. The install needs a C compiler. On CPython, it builds the C extension. On PyPy, which uses cffi instead of the C extension, it builds the `psutil` package, which has no wheels for PyPy. Without a C compiler, the install fails.
+Install UltraDict from the source on GitHub. On CPython, the install builds the C extension, which needs a C compiler. Without a C compiler, the install fails. PyPy needs no C compiler, because it uses cffi instead of the C extension.
 
 With uv, pin a tag or a commit hash with one of these commands. uv pins the commit in `uv.lock`:
 
 ```bash
-uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --tag v0.2.0
+uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --tag v0.2.1
 uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --rev <commit hash>
+```
+
+`steal_from_dead()` of the shared lock needs the `psutil` package. Add the extra `psutil` to install it. On PyPy, `psutil` needs a C compiler.
+
+```bash
+uv add "UltraDict[psutil] @ git+https://github.com/anush008/UltraDict" --tag v0.2.1
 ```
 
 With pip:
 
 ```bash
-pip install "UltraDict @ git+https://github.com/anush008/UltraDict@v0.2.0"
+pip install "UltraDict @ git+https://github.com/anush008/UltraDict@v0.2.1"
 ```
 
 For a Docker image without a C compiler, run `uv sync` in a build stage that has a C compiler, then copy the virtual environment into the final image.
@@ -501,7 +507,7 @@ python -m unittest
 ULTRADICT_PURE_PYTHON=1 python -m unittest
 ```
 
-To make a release, set `version` in `setup.py`, then push a tag with the same version, e.g. `v0.2.0`.
+To make a release, set `version` in `setup.py`, then push a tag with the same version, e.g. `v0.2.1`.
 
 `tests/api_check.py` calls every part of the public API and prints one line for each step. `tests/api_check_expected.txt` holds the output of the original implementation with the bug fixes below. The test `test_api_behavior_unchanged` fails if any step behaves differently.
 
