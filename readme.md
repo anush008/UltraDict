@@ -22,28 +22,34 @@ Features:
 
 Install UltraDict from the source on GitHub. On CPython, the install builds the C extension, which needs a C compiler. Without a C compiler, the install fails. PyPy needs no C compiler, because it uses cffi instead of the C extension.
 
-With uv, pin a tag or a commit hash with one of these commands. uv pins the commit in `uv.lock`:
+With uv, pin a commit hash:
 
 ```bash
-uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --tag v0.2.1
 uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --rev <commit hash>
+```
+
+This adds the commit hash to `pyproject.toml`:
+
+```toml
+[tool.uv.sources]
+ultradict = { git = "https://github.com/anush008/UltraDict", rev = "<commit hash>" }
 ```
 
 `steal_from_dead()` of the shared lock needs the `psutil` package. Add the extra `psutil` to install it. On PyPy, `psutil` needs a C compiler.
 
 ```bash
-uv add "UltraDict[psutil] @ git+https://github.com/anush008/UltraDict" --tag v0.2.1
+uv add "UltraDict[psutil] @ git+https://github.com/anush008/UltraDict" --rev <commit hash>
 ```
 
 With pip:
 
 ```bash
-pip install "UltraDict @ git+https://github.com/anush008/UltraDict@v0.2.1"
+pip install "UltraDict @ git+https://github.com/anush008/UltraDict@<commit hash>"
 ```
 
 For a Docker image without a C compiler, run `uv sync` in a build stage that has a C compiler, then copy the virtual environment into the final image.
 
-Always install a tag or a commit, never a branch, so each deploy gets the same code. All processes that share an UltraDict must use the same version of UltraDict, so update all of them together.
+Always install a commit hash, never a branch, so each deploy gets the same code. All processes that share an UltraDict must use the same version of UltraDict, so update all of them together.
 
 ## General Concept
 
@@ -507,7 +513,7 @@ python -m unittest
 ULTRADICT_PURE_PYTHON=1 python -m unittest
 ```
 
-To make a release, set `version` in `setup.py`, then push a tag with the same version, e.g. `v0.2.1`.
+Change `version` in `setup.py` when a change is ready for use. `uv pip list` and `pip list` show it.
 
 `tests/api_check.py` calls every part of the public API and prints one line for each step. `tests/api_check_expected.txt` holds the output of the original implementation with the bug fixes below. The test `test_api_behavior_unchanged` fails if any step behaves differently.
 
