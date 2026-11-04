@@ -114,7 +114,9 @@ Back in the first Python REPL:
 
 ## C extension
 
-UltraDict includes an optional C extension, `_fast`, that is built with Cython when you install the package. It moves the hot paths out of the Python interpreter: reads, writes, the replay of the update stream and the shared lock. UltraDict uses it automatically when it is available. Without it, UltraDict uses its pure Python implementation with the same behavior.
+UltraDict includes an optional C extension, `_fast`. It moves the hot paths out of the Python interpreter: reads, writes, the replay of the update stream and the shared lock. UltraDict uses it automatically when it is available. Without it, UltraDict uses its pure Python implementation with the same behavior.
+
+The wheels for CPython 3.11 to 3.14 on Linux, macOS and Windows contain the C extension, so they need no compiler. The workflow `.github/workflows/wheels.yml` builds and checks them. Other platforms build the C extension from the source distribution with Cython and a C compiler.
 
 Check which implementation is active:
 
