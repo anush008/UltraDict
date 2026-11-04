@@ -508,7 +508,7 @@ class UltraDict(collections.UserDict, FastCore):
             try:
                 import psutil
             except ModuleNotFoundError:
-                raise Exceptions.MissingDependency("Install `psutil` Python package to use shared_lock=True") from None
+                raise Exceptions.MissingDependency("Install the `psutil` package to use `steal_from_dead()`, e.g. with the extra `UltraDict[psutil]`") from None
             # No process must exist anymore with the from_pid or it must at least be dead (ie. zombie status)
             try:
                 p = psutil.Process(from_pid)
