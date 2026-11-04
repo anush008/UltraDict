@@ -9,13 +9,13 @@ Features:
 * No running manager processes
 * Works in spawn and fork context
 * Safe locking between independent processes
-* Tested with Python >= v3.8 on Linux, Windows and Mac
+* Tested with Python >= 3.11 and PyPy 3.11 on Linux, Windows and Mac
 * Convenient, no setter or getters necessary
 * Optional recursion for nested dicts
 
 [![PyPI Package](https://img.shields.io/pypi/v/ultradict.svg)](https://pypi.org/project/ultradict)
 [![Run Python Tests](https://github.com/ronny-rentner/UltraDict/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ronny-rentner/UltraDict/actions/workflows/ci.yml)
-[![Python >=3.8](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python >=3.11](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/github/license/ronny-rentner/UltraDict.svg)](https://github.com/ronny-rentner/UltraDict/blob/master/LICENSE.md)
 
 ## General Concept
@@ -124,11 +124,13 @@ Check which implementation is active:
 True
 ```
 
+On PyPy and other implementations than CPython, UltraDict uses the pure Python implementation, because the C extension uses CPython internals. PyPy's JIT compiler makes the pure Python implementation fast there.
+
 Set the environment variable `ULTRADICT_PURE_PYTHON=1` to use the pure Python implementation. Processes with and without the C extension can share the same UltraDict.
 
 With the C extension, `shared_lock=True` does not need the `atomics` package.
 
-On CPUs other than x86, e.g. arm64, use the C extension for the best read performance. These CPUs can reorder memory accesses, and only the C extension can use memory barriers. Without it, a read that finds changes from other processes takes the lock.
+On CPUs other than x86, e.g. arm64, the C extension uses memory barriers. Without it, a reader can see a change before its data is complete. The CRC32 checksum detects this, and the reader tries again a moment later.
 
 On macOS arm64, the wheel of `atomics` 1.0.3 contains a native library for x86_64. To use `shared_lock=True` there without the C extension, install `atomics` from source:
 
@@ -464,8 +466,6 @@ python -m unittest
 ULTRADICT_PURE_PYTHON=1 python -m unittest
 ```
 
-Set `ULTRADICT_LOCKED_REPLAY=1` with `ULTRADICT_PURE_PYTHON=1` to test the locked reads of CPUs other than x86 on an x86 CPU.
-
 `tests/api_check.py` calls every part of the public API and prints one line for each step. `tests/api_check_expected.txt` holds the output of the original implementation with the bug fixes below. The test `test_api_behavior_unchanged` fails if any step behaves differently.
 
 These bug fixes change the behavior of the original implementation:
@@ -473,4 +473,6 @@ These bug fixes change the behavior of the original implementation:
 * A change that cannot be serialized, e.g. a lambda as a value, raises the serialization error and changes nothing. Before, it changed the local copy but not the copies of other processes.
 * `UltraDict.SharedLock.reset()` releases the lock. Before, it always raised `ValueError`.
 * Deleting a key works with every serializer. Delete records now use `None` as their value. Before, they used `b''`, which a JSON serializer cannot write.
+* A reader ignores a delete in the stream for a key that its local copy does not have. Before, it raised `KeyError`, e.g. after another process changed its local copy with `|=`, which does not stream the change, or when two threads read through the same UltraDict.
+* `shared_lock=True` works on PyPy. Before, the `exchange()` of the `atomics` package returned a wrong value there, so a lock could not be released.
 * Only the UltraDict that created the recurse register unlinks the nested UltraDicts when it closes. Before, an UltraDict that only used the register of another UltraDict (`recurse_register`), or a nested UltraDict on `unlink()`, unlinked the whole tree. The owner then failed to close with `CannotAttachSharedMemory`.

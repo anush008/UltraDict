@@ -11,6 +11,10 @@ on:
   # Run the tests by hand on any branch from the Actions tab
   workflow_dispatch:
 
+# The tests only need to read the repository
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Test on ${{ matrix.config.name }} with Python ${{ matrix.python-version }}
@@ -38,12 +42,23 @@ jobs:
             os: windows-2025
             arch: x86
         # Run in all these versions of Python
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        # PyPy uses the pure Python implementation. PyPy has no 32 bit Windows build.
+        include:
+          - config: { name: "linux-x86_64", os: ubuntu-24.04, arch: x64 }
+            python-version: "pypy3.11"
+          - config: { name: "linux-aarch64", os: ubuntu-24.04-arm, arch: arm64 }
+            python-version: "pypy3.11"
+          - config: { name: "macos-x86_64", os: macos-15-intel, arch: x64 }
+            python-version: "pypy3.11"
+          - config: { name: "macos-arm64", os: macos-15, arch: arm64 }
+            python-version: "pypy3.11"
+          - config: { name: "win-amd64", os: windows-2025, arch: x64 }
+            python-version: "pypy3.11"
     steps:
       - uses: actions/checkout@v7
       - name: Install Python ${{ matrix.python-version }}
-        # v7 removes end-of-life Python versions, this matrix still tests 3.8 and 3.9
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.config.arch }}
@@ -60,20 +75,20 @@ jobs:
       - name: Install atomics from source on macOS arm64
         # The atomics 1.0.3 wheel for macOS arm64 contains a native library for x86_64
         if: matrix.config.name == 'macos-arm64'
-        run: pip install --force-reinstall --no-binary atomics atomics
+        run: pip install --force-reinstall --no-binary atomics "atomics==1.0.3"
       - name: Run unit tests without the C extension
         run: python -m unittest
         env:
           ULTRADICT_PURE_PYTHON: 1
       - name: Build the C extension
-        # Also test the C extension when the tests without it fail
-        if: success() || failure()
+        # Also test the C extension when the tests without it fail. It needs CPython.
+        if: (success() || failure()) && !startsWith(matrix.python-version, 'pypy')
         run: |
           pip install cython setuptools
           cythonize -3 -i _fast.pyx
           python -c "import sys; sys.path.insert(0, '..'); from UltraDict import UltraDict; assert UltraDict.accelerated"
       - name: Run unit tests with the C extension
-        if: success() || failure()
+        if: (success() || failure()) && !startsWith(matrix.python-version, 'pypy')
         run: python -m unittest
           #- name: Run pylint
           #run: pylint UltraDict.py

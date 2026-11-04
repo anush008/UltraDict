@@ -49,7 +49,7 @@ True and 1 same key: (str:'true', [str:'int'])
 unhashable get: raises TypeError
 unhashable set: raises TypeError
 unhashable contains: raises TypeError
-unpicklable value: raises AttributeError
+unpicklable value: raises PicklingError
 unpicklable value not stored: bool:False
 unpicklable value not stored remote: bool:False
 
@@ -74,7 +74,7 @@ items equal: bool:True
 reversed: raises TypeError
 sorted: [str:'a', str:'b']
 dict(): {str:'a': int:1, str:'b': int:2}
-json.dumps: str:'{}'
+json.dumps: str:'{"a": 1, "b": 2}'
 repr: str:"{'a': 1, 'b': 2}"
 str: str:"{'a': 1, 'b': 2}"
 format: str:"{'a': 1, 'b': 2}"
@@ -106,14 +106,14 @@ copy: raises KeyError
 copy type: raises KeyError
 copy.copy: raises KeyError
 copy.deepcopy: str:"UltraDict({str:'s': int:7, str:'n': NoneType:None, str:'u1': int:1, str:'u2': int:2, str:'u3': int:3, str:'u4': int:4, str:'u5': int:5, str:'u6': int:6})"
-or dict: raises TypeError
-or type: raises TypeError
-ror dict: raises TypeError
-ior: raises TypeError
+or dict: str:"UltraDict({str:'s': int:7, str:'n': NoneType:None, str:'u1': int:1, str:'u2': int:2, str:'u3': int:3, str:'u4': int:4, str:'u5': int:5, str:'u6': int:6, str:'or': int:1})"
+or type: str:'UltraDict'
+ror dict: str:"UltraDict({str:'ror': int:1, str:'s': int:7, str:'n': NoneType:None, str:'u1': int:1, str:'u2': int:2, str:'u3': int:3, str:'u4': int:4, str:'u5': int:5, str:'u6': int:6})"
+ior: (bool:True, bool:False)
 fromkeys: str:"UltraDict({str:'x': int:0, str:'y': int:0})"
 fromkeys type: str:'UltraDict'
-clear: (int:0, {})
-popitem empty: raises KeyError
+clear: (int:1, {str:'ior': int:1})
+popitem empty: (str:'ior', int:1)
 data attribute: ({str:'z': int:1}, str:'dict')
 data of other before access: {}
 data of other after access: {str:'z': int:1}
@@ -225,7 +225,7 @@ recurse children alive before creator close: [bool:True, bool:True]
 recurse register alive before creator close: bool:True
 recurse nested unlink: (bool:True, bool:True)
 recurse attacher close: {str:'nested': UltraDict({str:'counter': int:1, str:'deeper': UltraDict({str:'x': int:2})}), str:'list': [int:1, {str:'a': int:1}]}
-recurse creator close: raises AttributeError
+recurse creator close: {str:'nested': UltraDict({str:'counter': int:1, str:'deeper': UltraDict(closed)}), str:'list': [int:1, {str:'a': int:1}]}
 recurse children unlinked: [bool:False, bool:False]
 
 ## auto_unlink and close
@@ -257,7 +257,7 @@ after close apply_update: raises AlreadyClosed
 after close status: raises AttributeError
 shared after close setitem: raises AttributeError
 shared after close getitem: raises AlreadyClosed
-del keyword: bool:False
+del keyword: bool:True
 
 ## Processes
 spawn child with pickled UltraDict: (int:0, str:'yes')

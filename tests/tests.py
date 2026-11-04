@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 import subprocess
 import sys
 import os
@@ -12,6 +13,9 @@ if hasattr(UltraDict.log, 'disable'):
     UltraDict.log.disable(UltraDict.log.CRITICAL)
 else:
     UltraDict.log.set_level(UltraDict.log.Levels.error)
+
+# Retry budget in seconds for tests that simulate a writer whose data arrives late
+SLOW_RETRY_DELAYS = (0, 0.001, 0.01, 0.1, 0.5, 1, 2, 5)
 
 class UltraDictTests(unittest.TestCase):
 
@@ -214,7 +218,10 @@ class UltraDictTests(unittest.TestCase):
         writer = threading.Thread(target=write_record)
         writer.start()
         try:
-            self.assertEqual(other['late'], 2)
+            # The simulated delay is much longer than a real one, and a busy CI machine can make
+            # it longer still, so give the reader a longer retry budget than the default
+            with mock.patch.object(module, 'RECORD_RETRY_DELAYS', SLOW_RETRY_DELAYS):
+                self.assertEqual(other['late'], 2)
         finally:
             writer.join()
 
@@ -245,10 +252,61 @@ class UltraDictTests(unittest.TestCase):
         writer = threading.Thread(target=publish_name)
         writer.start()
         try:
-            self.assertEqual(other['a'], 2)
+            # See test_record_visible_later
+            with mock.patch.object(module, 'RECORD_RETRY_DELAYS', SLOW_RETRY_DELAYS):
+                self.assertEqual(other['a'], 2)
         finally:
             writer.join()
             memory.close()
+
+    def test_append_update_after_remote_full_dump(self):
+        # A writer that has not loaded the last full dump of another process yet
+        ultra = UltraDict(buffer_size=1000)
+        other = UltraDict(name=ultra.name)
+        other.dump()
+        ultra.append_update('k', 1)
+        self.assertEqual(other['k'], 1)
+        self.assertEqual(UltraDict(name=ultra.name)['k'], 1)
+
+    def test_repeated_delete_is_harmless(self):
+        # Two threads that read through the same UltraDict can apply the same delete twice
+        ultra = UltraDict()
+        other = UltraDict(name=ultra.name)
+        ultra['a'] = 1
+        self.assertEqual(other['a'], 1)
+        position = other.update_stream_position
+        del ultra['a']
+        self.assertNotIn('a', other)
+        # Replay the delete again, like a second thread that started at the same position
+        other.update_stream_position = position
+        other.apply_update()
+        self.assertNotIn('a', other)
+
+    def test_shared_lock_is_freed(self):
+        # The fork handler of a SharedLock must not keep it alive
+        import gc, weakref
+        ultra = UltraDict(shared_lock=True)
+        lock = weakref.ref(ultra.lock)
+        ultra.close()
+        del ultra
+        gc.collect()
+        self.assertIsNone(lock())
+
+    def run_crash_case(self, case):
+        ret = subprocess.run([sys.executable, 'tests/crash_cases.py', case],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        output = ret.stdout.decode(errors='replace')
+        self.assertEqual(ret.returncode, 0, output)
+        self.assertIn('ok:', output, output)
+
+    def test_close_during_replay(self):
+        self.run_crash_case('close_during_replay')
+
+    def test_bad_record_length(self):
+        self.run_crash_case('bad_record_length')
+
+    def test_exchange_after_close(self):
+        self.run_crash_case('exchange_after_close')
 
     def test_threads(self):
         # The default lock also protects against other threads in the same process
@@ -359,6 +417,10 @@ class UltraDictTests(unittest.TestCase):
 
         # The owner unlinks the whole tree, even if a nested UltraDict is gone already
         owner.close()
+        # On Windows, shared memory is gone only when every handle is closed. PyPy closes the
+        # handles of unreferenced UltraDicts only when its garbage collector runs.
+        del shared, deeper
+        gc.collect()
         self.assertFalse(exists(register))
         self.assertFalse(any(exists(name) for name in children))
 
@@ -469,10 +531,10 @@ class UltraDictTests(unittest.TestCase):
         # tests/api_check_expected.txt is the output of tests/api_check.py with the original
         # implementation of UltraDict, plus the bug fixes listed in readme.md. Every other step
         # of the API must still behave the same.
-        # Some versions of Python differ in the standard library, e.g. Python 3.8 has no `|` operator
-        # for dicts and pickle on Python 3.14 raises PicklingError for a lambda
-        if sys.version_info < (3, 9):
-            expected_file = 'tests/api_check_expected_py38.txt'
+        # Pickle on Python 3.14 raises PicklingError for a lambda, earlier versions AttributeError.
+        # PyPy frees objects only when its garbage collector runs and has a pure Python json encoder.
+        if sys.implementation.name == 'pypy':
+            expected_file = 'tests/api_check_expected_pypy.txt'
         elif sys.version_info >= (3, 14):
             expected_file = 'tests/api_check_expected_py314.txt'
         else:
@@ -557,13 +619,17 @@ class UltraDictTests(unittest.TestCase):
             return len([f for f in p.open_files() if f.path not in baseline])
 
         self.assertEqual(count(), 0, "file handle count before before tests should be 0")
+        # PyPy frees objects only when its garbage collector runs
+        import gc
         ultra = UltraDict(nested={ 1: 1})
         self.assertEqual(count(), 4, "file handle count with one simple UltraDict should be 4")
         del ultra
+        gc.collect()
         self.assertEqual(count(), 0, "file handle count after deleting the UltraDict should be 0 again")
         ultra = UltraDict(nested={ 1: 1}, recurse=True)
         self.assertEqual(count(), 12, "nested file handle count should be 12")
         del ultra
+        gc.collect()
         self.assertEqual(count(), 0, "nested file handle count after deleting UltraDict should be 0 again")
 
     def test_example_simple(self):

@@ -37,6 +37,8 @@ def cleanup_name(name):
 def fmt(value):
     """ Stable text for a result, without memory addresses or random names """
     if isinstance(value, UltraDict):
+        if value.closed:
+            return 'UltraDict(closed)'
         return f'UltraDict({fmt(dict(value.data))})'
     if isinstance(value, multiprocessing.shared_memory.SharedMemory):
         return 'SharedMemory'

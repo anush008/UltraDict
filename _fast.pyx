@@ -593,7 +593,8 @@ cdef class FastCore(dict):
     cdef int replay(self) except -1:
         """ See `replay_stream()`, returns 1 if a new full dump appeared """
         cdef Py_ssize_t pos = self.update_stream_position
-        cdef Py_ssize_t start, length
+        cdef Py_ssize_t start
+        cdef size_t length
         cdef unsigned char *p
         cdef unsigned char marker
         cdef uint32_t counter, checksum, actual
@@ -603,6 +604,10 @@ cdef class FastCore(dict):
         loads = None
 
         while True:
+            # Python code runs below, e.g. pickle may call __setstate__, and can close this
+            # UltraDict. Then the pointers to the shared memory are gone.
+            if self.position_ptr == NULL:
+                self.raise_already_closed()
             if pos >= <Py_ssize_t>ud_load_acquire_u32(self.position_ptr):
                 break
 
@@ -616,7 +621,8 @@ cdef class FastCore(dict):
             if p[9] != 0xFF:
                 raise AssertionError(f"Bad header in update stream at position {pos}")
             start = pos + HEADER_SIZE
-            if start + length > self.stream_length:
+            # Unsigned compare: a large length must not wrap around on 32 bit builds
+            if length > <size_t>(self.stream_length - start):
                 raise AssertionError(f"Bad header in update stream at position {pos}")
 
             # Copy the record, then check that no new full dump appeared meanwhile.
@@ -653,12 +659,13 @@ cdef class FastCore(dict):
             else:
                 raise AssertionError(f"Bad header in update stream at position {pos}")
 
+            # A delete can be applied twice when two threads read through the same UltraDict
             if mode:
                 data[key] = value
             else:
-                del data[key]
+                data.pop(key, None)
 
-            pos = start + length
+            pos = start + <Py_ssize_t>length
             # Remember that we have applied the update
             self.update_stream_position = pos
 
