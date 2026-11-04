@@ -21,7 +21,7 @@
 __all__ = ['UltraDict']
 
 import multiprocessing, multiprocessing.shared_memory, multiprocessing.synchronize
-import collections, marshal, os, pickle, platform, struct, sys, time, weakref, zlib
+import collections, marshal, os, pickle, struct, sys, time, weakref, zlib
 import importlib.util, importlib.machinery
 
 try:
@@ -121,16 +121,10 @@ else:
     class SharedLockCore():
         __slots__ = ()
 
-# Readers do not lock, so writers must make a record visible before the stream position that
-# points to it. x86 CPUs keep the order of stores and of loads. Other CPUs, e.g. arm64, can
-# reorder them and need memory barriers. The C extension uses barriers. Pure Python code cannot,
-# so on these CPUs, readers without the C extension apply changes while holding the lock.
-# Set ULTRADICT_LOCKED_REPLAY=1 to use the lock on all CPUs, e.g. to test this code path.
-WEAK_MEMORY_ORDER = platform.machine().lower() not in ('x86_64', 'amd64', 'i386', 'i686', 'x86')
-LOCKED_REPLAY = not ACCELERATED and (WEAK_MEMORY_ORDER or bool(os.environ.get('ULTRADICT_LOCKED_REPLAY')))
-# Maximum time in seconds that a read waits for the lock, see `UltraDict.acquire_for_replay()`
-REPLAY_LOCK_TIMEOUT = 0.1
-# Pauses in seconds before a reader reads a bad record again, see `UltraDict.apply_update_unlocked()`
+# Readers do not lock. On CPUs that can reorder memory accesses, e.g. arm64, a reader can see the
+# new stream position or full dump counter before the data it points to, if the writer does not
+# use the C extension. The CRC32 in each header detects this, see HEADER and FULL_DUMP_HEADER,
+# and the reader tries again after these pauses in seconds.
 RECORD_RETRY_DELAYS = (0, 0.0001, 0.001, 0.01, 0.1)
 
 # Errors that a bad record in the update stream raises.
@@ -142,7 +136,7 @@ if ACCELERATED:
     memory_fence = _fast.fence
 else:
     def memory_fence():
-        """ Pure Python has no memory barrier, see LOCKED_REPLAY """
+        """ Pure Python has no memory barrier, see RECORD_RETRY_DELAYS """
 
 def make_fast_exchange(atomic):
     """
@@ -175,8 +169,12 @@ def make_fast_exchange(atomic):
 
     # The C call releases the GIL, so each thread needs its own result buffer
     local = threading.local()
+    # The address must never be used after the shared memory is released, see `close()`
+    open_state = [True]
 
     def exchange(desired):
+        if not open_state[0]:
+            raise Exceptions.AlreadyClosed('The lock of this UltraDict is already closed')
         try:
             result = local.result
         except AttributeError:
@@ -184,6 +182,10 @@ def make_fast_exchange(atomic):
         c_exchange(address, values[desired], order, result)
         return result[0]
 
+    def close():
+        open_state[0] = False
+
+    exchange.close = close
     return exchange
 
 def python_attrs(attrs, core_attrs):
@@ -212,7 +214,7 @@ class UltraDict(collections.UserDict, FastCore):
         # With the C extension, `has_lock`, `pid` and `next_acquire_parameters` live in SharedLockCore
         __slots__ = python_attrs(('parent', 'has_lock',  'ctx', 'lock_atomic', 'lock_remote', \
             'pid', 'pid_bytes', 'pid_remote', 'pid_remote_ctx', 'pid_remote_atomic', \
-            'next_acquire_parameters', 'exchange'), ('has_lock', 'pid', 'next_acquire_parameters', 'exchange'))
+            'next_acquire_parameters', 'exchange', '__weakref__'), ('has_lock', 'pid', 'next_acquire_parameters', 'exchange'))
 
         def __init__(self, parent, lock_name, pid_name):
             self.has_lock = 0
@@ -254,12 +256,19 @@ class UltraDict(collections.UserDict, FastCore):
                 self.pid_remote_atomic = self.pid_remote_ctx.__enter__()
                 self.exchange = make_fast_exchange(self.lock_atomic) or self.exchange_public_api
 
+            # Python cannot remove a fork handler, so it only holds a weak reference to the lock
+            weak_self = weakref.ref(self)
+
             def after_fork():
-                if self.has_lock:
+                lock = weak_self()
+                if lock is None or not hasattr(lock, 'pid_bytes'):
+                    # Gone or closed
+                    return
+                if lock.has_lock:
                     raise Exception("Release the SharedLock before you fork the process")
 
                 # After forking, we got a new pid
-                self.init_pid()
+                lock.init_pid()
 
             if sys.platform != 'win32':
                 os.register_at_fork(after_in_child=after_fork)
@@ -461,6 +470,8 @@ class UltraDict(collections.UserDict, FastCore):
             if ACCELERATED:
                 self._unbind()
             elif hasattr(self, 'exchange'):
+                if hasattr(self.exchange, 'close'):
+                    self.exchange.close()
                 del self.exchange
             if hasattr(self, 'ctx'):
                 self.ctx.__exit__(None, None, None)
@@ -967,8 +978,10 @@ class UltraDict(collections.UserDict, FastCore):
 
         # Write header and body directly into the shared memory, without
         # concatenating them in a temporary bytes object first
+        # Seed the CRC32 with the shared counter. The local counter is old if we have not loaded
+        # the last full dump yet, e.g. in append_update(). The lock keeps the shared counter stable.
         buf = self.buffer_remote
-        checksum = zlib.crc32(marshalled, self.full_dump_counter & 0xFFFFFFFF)
+        checksum = zlib.crc32(marshalled, self.full_dump_counter_remote[0])
         buf[start_position + HEADER_SIZE:end_position] = marshalled
         HEADER.pack_into(buf, start_position, marker, length, checksum, 0xFF)
 
@@ -981,31 +994,6 @@ class UltraDict(collections.UserDict, FastCore):
     def apply_update(self):
         """ Opportunistically apply dict changes from shared memory stream without any locking.  """
 
-        if LOCKED_REPLAY and self.changed() and self.acquire_for_replay():
-            # See LOCKED_REPLAY. Writers release the lock only after their changes are complete.
-            try:
-                return self.apply_update_unlocked()
-            finally:
-                self.fast_lock.release()
-        return self.apply_update_unlocked()
-
-    def acquire_for_replay(self):
-        """
-        Try to get the lock for at most REPLAY_LOCK_TIMEOUT seconds, see LOCKED_REPLAY.
-        Reads must never wait long, e.g. for a stale lock of a crashed process.
-        If the lock is not free in time, the read continues without the lock.
-        """
-        lock = self.fast_lock
-        try:
-            if isinstance(lock, UltraDict.SharedLock):
-                return lock.acquire(timeout=REPLAY_LOCK_TIMEOUT)
-            return lock.acquire(True, REPLAY_LOCK_TIMEOUT)
-        except Exceptions.CannotAcquireLock:
-            return False
-
-    def apply_update_unlocked(self):
-        """ See `apply_update()` """
-
         if self.full_dump_counter < self.full_dump_counter_remote[0]:
             self.load(force=True)
 
@@ -1013,7 +1001,7 @@ class UltraDict(collections.UserDict, FastCore):
             try:
                 if self.replay_stream():
                     # A new full dump appeared while we were reading the stream
-                    return self.apply_update_unlocked()
+                    return self.apply_update()
             except RECORD_ERRORS:
 
                 # It can happen that a slow process is not fast enough reading the stream and some
@@ -1021,27 +1009,22 @@ class UltraDict(collections.UserDict, FastCore):
                 # recover from this situation if and only if a new, fresh full dump exists that can be loaded.
                 if self.full_dump_counter < self.full_dump_counter_remote[0]:
                     log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
-                    return self.apply_update_unlocked()
+                    return self.apply_update()
 
-                # As a last resort, let's get a lock. This way we are safe but slow.
-                with self.fast_lock:
-                    if self.full_dump_counter < self.full_dump_counter_remote[0]:
-                        log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
-                        return self.apply_update_unlocked()
-
-                    # On CPUs with weak memory order, a writer without the C extension can make
-                    # the stream position visible before the record. If the writers use the same
-                    # lock, the record is complete now, because they release the lock only after
-                    # writing. A reader that attached by name with the default lock has its own
-                    # lock, so wait a moment for the record to arrive. A record that is still bad
-                    # after all retries is damaged.
-                    for delay in RECORD_RETRY_DELAYS:
-                        time.sleep(delay)
+                # The record can be incomplete, see RECORD_RETRY_DELAYS. Writers release the lock
+                # only after their record is complete, so read it again under the lock. A reader
+                # that attached by name with the default lock has its own lock, so it also waits
+                # a moment for the record to arrive. The pauses happen without the lock, so other
+                # processes can write meanwhile. A record that is still bad at the end is damaged.
+                for delay in RECORD_RETRY_DELAYS:
+                    time.sleep(delay)
+                    with self.fast_lock:
                         if self.full_dump_counter < self.full_dump_counter_remote[0]:
-                            return self.apply_update_unlocked()
+                            log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
+                            return self.apply_update()
                         try:
                             if self.replay_stream():
-                                return self.apply_update_unlocked()
+                                return self.apply_update()
                             return None
                         except RECORD_ERRORS:
                             if delay == RECORD_RETRY_DELAYS[-1]:
@@ -1094,11 +1077,12 @@ class UltraDict(collections.UserDict, FastCore):
             else:
                 raise AssertionError(f"Bad header in update stream at position {pos - HEADER_SIZE}")
 
-            # Update or local dict cache (in our parent)
+            # Update or local dict cache (in our parent).
+            # A delete can be applied twice when two threads read through the same UltraDict.
             if mode:
                 data[key] = value
             else:
-                del data[key]
+                data.pop(key, None)
             pos += length
             # Remember that we have applied the update
             self.update_stream_position = pos
@@ -1230,48 +1214,23 @@ class UltraDict(collections.UserDict, FastCore):
                 raise
 
             with self.fast_lock:
-                remote_position = self.update_stream_position_remote
-                start_position = remote_position[0]
-
-                # Fast check for remote changes, see `changed()`
-                if self.update_stream_position != start_position \
-                        or self.full_dump_counter != self.full_dump_counter_remote[0]:
+                if self.changed():
                     self.apply_update()
-                    start_position = remote_position[0]
 
                 # Update our local copy
                 # It's important for the integrity to do this first
                 self.data[key] = item
 
-                # Append the update to the update stream. This is an inlined
-                # version of `append_marshalled()` for the case that the buffer is not full.
-                length = len(marshalled)
-                end_position = start_position + HEADER_SIZE + length
-                if end_position > self.buffer_size:
-                    self.append_marshalled(marker, marshalled, key, item, False)
-                    return
-
-                buf = self.buffer_remote
-                checksum = zlib.crc32(marshalled, self.full_dump_counter & 0xFFFFFFFF)
-                buf[start_position + HEADER_SIZE:end_position] = marshalled
-                HEADER.pack_into(buf, start_position, marker, length, checksum, 0xFF)
-
-                # Inform others about it, only after the full record is written
-                self.update_stream_position = end_position
-                remote_position[0] = end_position
+                # Append the update to the update stream
+                self.append_marshalled(marker, marshalled, key, item, False)
                 # TODO: Do something if append_update() fails
 
         def __getitem__(self, key):
             #log.debug("__getitem__ {}", key)
 
-            # Fast check for remote changes. Calling apply_update() only when the stream position
-            # or the full dump counter has changed saves a function call on every read.
-            try:
-                if self.update_stream_position != self.update_stream_position_remote[0] \
-                        or self.full_dump_counter != self.full_dump_counter_remote[0]:
-                    self.apply_update()
-            except AttributeError:
-                # Closed, apply_update() raises AlreadyClosed
+            # Calling apply_update() only when the stream position or the full dump counter
+            # has changed saves a function call on every read
+            if self.changed():
                 self.apply_update()
             return self.data[key]
 

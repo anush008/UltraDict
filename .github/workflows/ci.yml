@@ -11,6 +11,10 @@ on:
   # Run the tests by hand on any branch from the Actions tab
   workflow_dispatch:
 
+# The tests only need to read the repository
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Test on ${{ matrix.config.name }} with Python ${{ matrix.python-version }}
@@ -60,7 +64,7 @@ jobs:
       - name: Install atomics from source on macOS arm64
         # The atomics 1.0.3 wheel for macOS arm64 contains a native library for x86_64
         if: matrix.config.name == 'macos-arm64'
-        run: pip install --force-reinstall --no-binary atomics atomics
+        run: pip install --force-reinstall --no-binary atomics "atomics==1.0.3"
       - name: Run unit tests without the C extension
         run: python -m unittest
         env:

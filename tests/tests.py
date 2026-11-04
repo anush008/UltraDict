@@ -250,6 +250,55 @@ class UltraDictTests(unittest.TestCase):
             writer.join()
             memory.close()
 
+    def test_append_update_after_remote_full_dump(self):
+        # A writer that has not loaded the last full dump of another process yet
+        ultra = UltraDict(buffer_size=1000)
+        other = UltraDict(name=ultra.name)
+        other.dump()
+        ultra.append_update('k', 1)
+        self.assertEqual(other['k'], 1)
+        self.assertEqual(UltraDict(name=ultra.name)['k'], 1)
+
+    def test_repeated_delete_is_harmless(self):
+        # Two threads that read through the same UltraDict can apply the same delete twice
+        ultra = UltraDict()
+        other = UltraDict(name=ultra.name)
+        ultra['a'] = 1
+        self.assertEqual(other['a'], 1)
+        position = other.update_stream_position
+        del ultra['a']
+        self.assertNotIn('a', other)
+        # Replay the delete again, like a second thread that started at the same position
+        other.update_stream_position = position
+        other.apply_update()
+        self.assertNotIn('a', other)
+
+    def test_shared_lock_is_freed(self):
+        # The fork handler of a SharedLock must not keep it alive
+        import gc, weakref
+        ultra = UltraDict(shared_lock=True)
+        lock = weakref.ref(ultra.lock)
+        ultra.close()
+        del ultra
+        gc.collect()
+        self.assertIsNone(lock())
+
+    def run_crash_case(self, case):
+        ret = subprocess.run([sys.executable, 'tests/crash_cases.py', case],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        output = ret.stdout.decode(errors='replace')
+        self.assertEqual(ret.returncode, 0, output)
+        self.assertIn('ok:', output, output)
+
+    def test_close_during_replay(self):
+        self.run_crash_case('close_during_replay')
+
+    def test_bad_record_length(self):
+        self.run_crash_case('bad_record_length')
+
+    def test_exchange_after_close(self):
+        self.run_crash_case('exchange_after_close')
+
     def test_threads(self):
         # The default lock also protects against other threads in the same process
         import threading

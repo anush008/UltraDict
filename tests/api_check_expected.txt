@@ -116,7 +116,7 @@ clear: (int:1, {str:'ior': int:1})
 popitem empty: (str:'ior', int:1)
 data attribute: ({str:'z': int:1}, str:'dict')
 data of other before access: {}
-data of other after access: raises KeyError
+data of other after access: {str:'z': int:1}
 
 ## Pickle and copy across instances
 pickle roundtrip: str:"UltraDict({str:'p': int:1})"
