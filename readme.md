@@ -18,6 +18,24 @@ Features:
 [![Python >=3.11](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/github/license/ronny-rentner/UltraDict.svg)](https://github.com/ronny-rentner/UltraDict/blob/master/LICENSE.md)
 
+## Installation
+
+Install a wheel from a GitHub release. The CPython wheels contain the C extension, so the machine needs no C compiler. Copy the link of the wheel for your platform and Python version from the [release page](https://github.com/anush008/UltraDict/releases):
+
+```bash
+pip install "https://github.com/anush008/UltraDict/releases/download/v0.1.0/<wheel file name>"
+```
+
+PyPy and other platforms use the wheel that ends with `py3-none-any.whl`.
+
+You can also install from the source on GitHub. Then pip builds the C extension, which needs Cython and a C compiler. Without a C compiler, UltraDict uses its pure Python implementation and pip shows a warning.
+
+```bash
+pip install "UltraDict @ git+https://github.com/anush008/UltraDict@v0.1.0"
+```
+
+Always install a tag or a commit, never a branch, so each deploy gets the same code. All processes that share an UltraDict must use the same version of UltraDict, so update all of them together.
+
 ## General Concept
 
 `UltraDict` uses [multiprocessing.shared_memory](https://docs.python.org/3/library/multiprocessing.shared_memory.html#module-multiprocessing.shared_memory) to synchronize a dict between multiple processes.
@@ -479,6 +497,8 @@ python setup.py build_ext --inplace
 python -m unittest
 ULTRADICT_PURE_PYTHON=1 python -m unittest
 ```
+
+To make a release, set `version` in `setup.py`, then push a tag with the same version, e.g. `v0.1.0`. The workflow `.github/workflows/wheels.yml` then attaches the wheels and the source distribution to a new GitHub release.
 
 `tests/api_check.py` calls every part of the public API and prints one line for each step. `tests/api_check_expected.txt` holds the output of the original implementation with the bug fixes below. The test `test_api_behavior_unchanged` fails if any step behaves differently.
 
