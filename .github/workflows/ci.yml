@@ -43,7 +43,7 @@ jobs:
             arch: x86
         # Run in all these versions of Python
         python-version: ["3.11", "3.12", "3.13", "3.14"]
-        # PyPy uses the pure Python implementation. PyPy has no 32 bit Windows build.
+        # PyPy uses cffi instead of the C extension. PyPy has no 32 bit Windows build.
         include:
           - config: { name: "linux-x86_64", os: ubuntu-24.04, arch: x64 }
             python-version: "pypy3.11"
@@ -87,8 +87,8 @@ jobs:
           pip install cython setuptools
           cythonize -3 -i _fast.pyx
           python -c "import sys; sys.path.insert(0, '..'); from UltraDict import UltraDict; assert UltraDict.accelerated"
-      - name: Run unit tests with the C extension
-        if: (success() || failure()) && !startsWith(matrix.python-version, 'pypy')
+      - name: Run unit tests with the C extension, or with cffi on PyPy
+        if: success() || failure()
         run: python -m unittest
           #- name: Run pylint
           #run: pylint UltraDict.py
