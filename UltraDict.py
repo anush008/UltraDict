@@ -118,6 +118,12 @@ WEAK_MEMORY_ORDER = platform.machine().lower() not in ('x86_64', 'amd64', 'i386'
 LOCKED_REPLAY = not ACCELERATED and (WEAK_MEMORY_ORDER or bool(os.environ.get('ULTRADICT_LOCKED_REPLAY')))
 # Maximum time in seconds that a read waits for the lock, see `UltraDict.acquire_for_replay()`
 REPLAY_LOCK_TIMEOUT = 0.1
+# Pauses in seconds before a reader reads a bad record again, see `UltraDict.apply_update_unlocked()`
+RECORD_RETRY_DELAYS = (0, 0.0001, 0.001, 0.01, 0.1)
+
+# Errors that a bad record in the update stream raises.
+# EOFError and ValueError come from marshal on a damaged record.
+RECORD_ERRORS = (AssertionError, struct.error, pickle.UnpicklingError, EOFError, ValueError)
 
 if ACCELERATED:
     # Full memory barrier, used around full dumps
@@ -991,8 +997,7 @@ class UltraDict(collections.UserDict, FastCore):
                 if self.replay_stream():
                     # A new full dump appeared while we were reading the stream
                     return self.apply_update_unlocked()
-            except (AssertionError, struct.error, pickle.UnpicklingError, EOFError, ValueError) as e:
-                # EOFError and ValueError come from marshal on a damaged record
+            except RECORD_ERRORS:
 
                 # It can happen that a slow process is not fast enough reading the stream and some
                 # other process already got around overwriting the current position. It is possible to
@@ -1008,11 +1013,22 @@ class UltraDict(collections.UserDict, FastCore):
                         return self.apply_update_unlocked()
 
                     # On CPUs with weak memory order, a writer without the C extension can make
-                    # the stream position visible before the record. Writers release the lock only
-                    # after their records are complete, so read the stream again under the lock.
-                    # A record that is still bad is damaged.
-                    if self.replay_stream():
-                        return self.apply_update_unlocked()
+                    # the stream position visible before the record. If the writers use the same
+                    # lock, the record is complete now, because they release the lock only after
+                    # writing. A reader that attached by name with the default lock has its own
+                    # lock, so wait a moment for the record to arrive. A record that is still bad
+                    # after all retries is damaged.
+                    for delay in RECORD_RETRY_DELAYS:
+                        time.sleep(delay)
+                        if self.full_dump_counter < self.full_dump_counter_remote[0]:
+                            return self.apply_update_unlocked()
+                        try:
+                            if self.replay_stream():
+                                return self.apply_update_unlocked()
+                            return None
+                        except RECORD_ERRORS:
+                            if delay == RECORD_RETRY_DELAYS[-1]:
+                                raise
 
     def replay_stream_python(self):
         """

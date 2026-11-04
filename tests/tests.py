@@ -2,6 +2,7 @@ import unittest
 import subprocess
 import sys
 import os
+import time
 
 sys.path.insert(0, '..')
 from UltraDict import UltraDict
@@ -185,6 +186,34 @@ class UltraDictTests(unittest.TestCase):
                 del expected[key]
                 self.assertNotIn(key, by_key_other)
         self.assertEqual(len(by_key_other), 0)
+
+    def test_record_visible_later(self):
+        # On CPUs with weak memory order, a reader can see the new stream position before the
+        # record. Simulate it: publish the position first and write the record a moment later.
+        import threading, pickle
+        ultra = UltraDict(buffer_size=10_000)
+        other = UltraDict(name=ultra.name)
+        ultra['before'] = 1
+        self.assertEqual(other['before'], 1)
+
+        body = pickle.dumps((True, 'late', 2))
+        start = ultra.update_stream_position_remote[0]
+        end = start + 6 + len(body)
+        ultra.buffer.buf[start:end] = bytes(end - start)
+        ultra.update_stream_position = end
+        ultra.update_stream_position_remote[0] = end
+
+        def write_record():
+            time.sleep(0.02)
+            ultra.buffer.buf[start + 6:end] = body
+            ultra.buffer.buf[start:start + 6] = b'\xff' + len(body).to_bytes(4, 'little') + b'\xff'
+
+        writer = threading.Thread(target=write_record)
+        writer.start()
+        try:
+            self.assertEqual(other['late'], 2)
+        finally:
+            writer.join()
 
     def test_threads(self):
         # The default lock also protects against other threads in the same process
