@@ -8,7 +8,7 @@ import Cython.Build
 this_directory = Path(__file__).parent
 long_description = (this_directory / "readme.md").read_text()
 
-version = '0.2.1'
+version = '1.0.0'
 
 # C implementation of the hot paths. A CPython install needs a C compiler for it.
 ext_fast = Extension(name="UltraDict._fast", sources=["_fast.pyx"], include_dirs=["."], depends=["_fast_atomic.h"])
