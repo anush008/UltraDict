@@ -54,9 +54,18 @@ cdef extern from "_fast_atomic.h":
     uint32_t ud_load_acquire_u32(uint32_t *p) nogil
     void ud_store_release_u32(uint32_t *p, uint32_t v) nogil
     void ud_fence_acquire() nogil
+    void ud_fence_full() nogil
+    int ud_cmpxchg_u32(uint32_t *p, uint32_t expected, uint32_t desired) nogil
 
 # UltraDict.py only uses this module if the version matches
-VERSION = 1
+VERSION = 2
+
+def fence():
+    """
+    Full memory barrier. Loads and stores before it are not reordered with loads and stores
+    after it. UltraDict.py uses it around full dumps, which are written in Python.
+    """
+    ud_fence_full()
 
 cdef enum:
     HEADER_SIZE = 6
@@ -263,6 +272,21 @@ cdef class SharedLockCore:
         """ Atomically set the lock byte to `desired` (0 or 1) and return the old value """
         self.check_bound('exchange')
         return ud_exchange_u8(self.lock_ptr, 1 if desired else 0)
+
+    def compare_exchange_pid(self, expected, desired):
+        """
+        Atomically replace the owner PID with `desired` if it is `expected`.
+        Both are 4 bytes, little endian, like `pid_remote`. Returns True on success.
+        """
+        cdef const unsigned char[:] expected_view = expected
+        cdef const unsigned char[:] desired_view = desired
+        cdef uint32_t expected_raw, desired_raw
+        self.check_bound('pid_remote_atomic')
+        if expected_view.shape[0] != 4 or desired_view.shape[0] != 4:
+            raise ValueError("expected and desired must have 4 bytes")
+        memcpy(&expected_raw, &expected_view[0], 4)
+        memcpy(&desired_raw, &desired_view[0], 4)
+        return ud_cmpxchg_u32(<uint32_t *>self.pid_ptr, expected_raw, desired_raw) == 1
 
     def test_and_inc(self):
         self.check_bound('exchange')

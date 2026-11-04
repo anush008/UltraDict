@@ -21,7 +21,7 @@
 __all__ = ['UltraDict']
 
 import multiprocessing, multiprocessing.shared_memory, multiprocessing.synchronize
-import collections, marshal, os, pickle, struct, sys, time, weakref
+import collections, marshal, os, pickle, platform, struct, sys, time, weakref
 import importlib.util, importlib.machinery
 
 try:
@@ -96,7 +96,7 @@ ACCELERATED = False
 if not os.environ.get('ULTRADICT_PURE_PYTHON'):
     try:
         from . import _fast
-        if getattr(_fast, 'VERSION', None) == 1:
+        if getattr(_fast, 'VERSION', None) == 2:
             ACCELERATED = True
     except ImportError:
         pass
@@ -108,6 +108,23 @@ else:
     FastCore = dict
     class SharedLockCore():
         __slots__ = ()
+
+# Readers do not lock, so writers must make a record visible before the stream position that
+# points to it. x86 CPUs keep the order of stores and of loads. Other CPUs, e.g. arm64, can
+# reorder them and need memory barriers. The C extension uses barriers. Pure Python code cannot,
+# so on these CPUs, readers without the C extension apply changes while holding the lock.
+# Set ULTRADICT_LOCKED_REPLAY=1 to use the lock on all CPUs, e.g. to test this code path.
+WEAK_MEMORY_ORDER = platform.machine().lower() not in ('x86_64', 'amd64', 'i386', 'i686', 'x86')
+LOCKED_REPLAY = not ACCELERATED and (WEAK_MEMORY_ORDER or bool(os.environ.get('ULTRADICT_LOCKED_REPLAY')))
+# Maximum time in seconds that a read waits for the lock, see `UltraDict.acquire_for_replay()`
+REPLAY_LOCK_TIMEOUT = 0.1
+
+if ACCELERATED:
+    # Full memory barrier, used around full dumps
+    memory_fence = _fast.fence
+else:
+    def memory_fence():
+        """ Pure Python has no memory barrier, see LOCKED_REPLAY """
 
 def make_fast_exchange(atomic):
     """
@@ -191,19 +208,32 @@ class UltraDict(collections.UserDict, FastCore):
 
             self.init_pid()
 
-            try:
-                self.ctx = atomics.atomicview(buffer=self.lock_remote[0:1], atype=atomics.BYTES)
-                self.pid_remote_ctx = atomics.atomicview(buffer=self.pid_remote[0:4], atype=atomics.BYTES)
-            except NameError as e:
-                self.cleanup()
-                raise e
-            self.lock_atomic = self.ctx.__enter__()
-            self.pid_remote_atomic = self.pid_remote_ctx.__enter__()
-
             if ACCELERATED:
-                # The C base class works on the lock byte and the PID bytes directly
+                # The C base class works on the lock byte and the PID bytes directly,
+                # it does not need the atomics package
                 self._bind(self.lock_remote, self.pid_remote)
             else:
+                load_error = None
+                try:
+                    self.ctx = atomics.atomicview(buffer=self.lock_remote[0:1], atype=atomics.BYTES)
+                    self.pid_remote_ctx = atomics.atomicview(buffer=self.pid_remote[0:4], atype=atomics.BYTES)
+                except NameError as e:
+                    self.cleanup()
+                    raise e
+                except OSError as e:
+                    # The native library of atomics cannot be loaded, e.g. the atomics 1.0.3
+                    # wheel for macOS arm64 contains a library for x86_64
+                    load_error = str(e)
+                if load_error is not None:
+                    # Raised outside of the except block, so the traceback of the OSError and the
+                    # half created atomics objects with their exports of the shared memory are freed
+                    self.cleanup()
+                    raise Exceptions.MissingDependency(
+                        f"The `atomics` package cannot load its native library ({load_error}). "
+                        "Build the UltraDict C extension, or install atomics from source with "
+                        "`pip install --force-reinstall --no-binary atomics atomics`.")
+                self.lock_atomic = self.ctx.__enter__()
+                self.pid_remote_atomic = self.pid_remote_ctx.__enter__()
                 self.exchange = make_fast_exchange(self.lock_atomic) or self.exchange_public_api
 
             def after_fork():
@@ -360,12 +390,15 @@ class UltraDict(collections.UserDict, FastCore):
 
             # Stealing the lock means actually just putting our pid into the shared memory overwriting the other pid.
             # This can go wrong if the lock owner is actually still alive and working.
-            result = self.pid_remote_atomic.cmpxchg_strong(expected=from_pid.to_bytes(4, 'little'), desired=self.pid_bytes)
-            if result.success:
+            if ACCELERATED:
+                success = self.compare_exchange_pid(from_pid.to_bytes(4, 'little'), self.pid_bytes)
+            else:
+                success = self.pid_remote_atomic.cmpxchg_strong(expected=from_pid.to_bytes(4, 'little'), desired=self.pid_bytes).success
+            if success:
                 self.has_lock = 1
                 if release:
                     self.release()
-            return result.success
+            return success
 
         def steal_from_dead(self, from_pid=0, release=False):
             """ Check if from_pid is actually a dead process and if yes, steal the lock from it.
@@ -760,12 +793,17 @@ class UltraDict(collections.UserDict, FastCore):
             if not (self.full_dump_size and self.full_dump_memory):
                 self.full_dump_memory_name_remote[:] = full_dump_memory.name.encode('utf-8').ljust(255)
 
+            # The full dump and its name must be visible to other processes before the
+            # stream position and the counter change, see `memory_fence()`
+            memory_fence()
+
             # Reset the stream position to zero as we have
             # just provided a fresh new full dump.
             # This must happen before the counter is incremented: a reader that sees the new
             # counter loads the full dump and then must not replay old records of the stream.
             self.update_stream_position = 0
             self.update_stream_position_remote[0] = 0
+            memory_fence()
 
             self.full_dump_counter += 1
             current = self.full_dump_counter_remote[0]
@@ -817,6 +855,8 @@ class UltraDict(collections.UserDict, FastCore):
         we didn't have the chance to load the old one. In this case, we just retry.
         """
         full_dump_counter = self.full_dump_counter_remote[0]
+        # Read the name and the full dump only after the counter, see `memory_fence()`
+        memory_fence()
         #log.debug("Loading full dump local_counter={} remote_counter={}", self.full_dump_counter, full_dump_counter)
         try:
             if force or (self.full_dump_counter < full_dump_counter):
@@ -918,6 +958,31 @@ class UltraDict(collections.UserDict, FastCore):
     def apply_update(self):
         """ Opportunistically apply dict changes from shared memory stream without any locking.  """
 
+        if LOCKED_REPLAY and self.changed() and self.acquire_for_replay():
+            # See LOCKED_REPLAY. Writers release the lock only after their changes are complete.
+            try:
+                return self.apply_update_unlocked()
+            finally:
+                self.fast_lock.release()
+        return self.apply_update_unlocked()
+
+    def acquire_for_replay(self):
+        """
+        Try to get the lock for at most REPLAY_LOCK_TIMEOUT seconds, see LOCKED_REPLAY.
+        Reads must never wait long, e.g. for a stale lock of a crashed process.
+        If the lock is not free in time, the read continues without the lock.
+        """
+        lock = self.fast_lock
+        try:
+            if isinstance(lock, UltraDict.SharedLock):
+                return lock.acquire(timeout=REPLAY_LOCK_TIMEOUT)
+            return lock.acquire(True, REPLAY_LOCK_TIMEOUT)
+        except Exceptions.CannotAcquireLock:
+            return False
+
+    def apply_update_unlocked(self):
+        """ See `apply_update()` """
+
         if self.full_dump_counter < self.full_dump_counter_remote[0]:
             self.load(force=True)
 
@@ -925,7 +990,7 @@ class UltraDict(collections.UserDict, FastCore):
             try:
                 if self.replay_stream():
                     # A new full dump appeared while we were reading the stream
-                    return self.apply_update()
+                    return self.apply_update_unlocked()
             except (AssertionError, struct.error, pickle.UnpicklingError, EOFError, ValueError) as e:
                 # EOFError and ValueError come from marshal on a damaged record
 
@@ -934,15 +999,20 @@ class UltraDict(collections.UserDict, FastCore):
                 # recover from this situation if and only if a new, fresh full dump exists that can be loaded.
                 if self.full_dump_counter < self.full_dump_counter_remote[0]:
                     log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
-                    return self.apply_update()
+                    return self.apply_update_unlocked()
 
                 # As a last resort, let's get a lock. This way we are safe but slow.
                 with self.fast_lock:
                     if self.full_dump_counter < self.full_dump_counter_remote[0]:
                         log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
-                        return self.apply_update()
+                        return self.apply_update_unlocked()
 
-                raise e
+                    # On CPUs with weak memory order, a writer without the C extension can make
+                    # the stream position visible before the record. Writers release the lock only
+                    # after their records are complete, so read the stream again under the lock.
+                    # A record that is still bad is damaged.
+                    if self.replay_stream():
+                        return self.apply_update_unlocked()
 
     def replay_stream_python(self):
         """

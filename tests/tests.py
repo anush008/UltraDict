@@ -377,7 +377,8 @@ class UltraDictTests(unittest.TestCase):
     def test_full_dump_resets_stream(self):
         ultra = UltraDict(buffer_size=1000)
         other = UltraDict(name=ultra.name)
-        for i in range(1000):
+        # The real buffer can be bigger, e.g. 16 KB pages on macOS arm64. Each record is at least 10 bytes.
+        for i in range(ultra.buffer_size // 10 * 3):
             ultra[i] = i
             self.assertEqual(other[i], i)
         self.assertGreater(ultra.full_dump_counter, 1)

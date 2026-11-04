@@ -126,6 +126,16 @@ True
 
 Set the environment variable `ULTRADICT_PURE_PYTHON=1` to use the pure Python implementation. Processes with and without the C extension can share the same UltraDict.
 
+With the C extension, `shared_lock=True` does not need the `atomics` package.
+
+On CPUs other than x86, e.g. arm64, use the C extension for the best read performance. These CPUs can reorder memory accesses, and only the C extension can use memory barriers. Without it, a read that finds changes from other processes takes the lock.
+
+On macOS arm64, the wheel of `atomics` 1.0.3 contains a native library for x86_64. To use `shared_lock=True` there without the C extension, install `atomics` from source:
+
+```bash
+pip install --force-reinstall --no-binary atomics atomics
+```
+
 Time per operation on Python 3.13, Linux x86_64, with simple keys and values and the default `buffer_size`:
 
 | Operation | Before the C extension | Pure Python | C extension |
@@ -453,6 +463,8 @@ python setup.py build_ext --inplace
 python -m unittest
 ULTRADICT_PURE_PYTHON=1 python -m unittest
 ```
+
+Set `ULTRADICT_LOCKED_REPLAY=1` with `ULTRADICT_PURE_PYTHON=1` to test the locked reads of CPUs other than x86 on an x86 CPU.
 
 `tests/api_check.py` calls every part of the public API and prints one line for each step. `tests/api_check_expected.txt` holds the output of the original implementation with the bug fixes below. The test `test_api_behavior_unchanged` fails if any step behaves differently.
 

@@ -40,6 +40,22 @@ static __inline void ud_store_release_u32(uint32_t *p, uint32_t v) {
 static __inline void ud_fence_acquire(void) { UD_HW_BARRIER(); }
 static __inline void ud_fence_release(void) { UD_HW_BARRIER(); }
 
+static __inline void ud_fence_full(void) {
+#if defined(_M_ARM64) || defined(_M_ARM)
+    __dmb(_ARM64_BARRIER_ISH);
+#else
+    /* A locked operation is a full barrier on x86 and x64 */
+    volatile long dummy = 0;
+    _InterlockedExchange(&dummy, 0);
+#endif
+}
+
+/* Compare the 4 bytes at p with expected. If they are equal, write desired and return 1.
+   Otherwise return 0. The values are raw memory, so byte order does not matter. */
+static __inline int ud_cmpxchg_u32(uint32_t *p, uint32_t expected, uint32_t desired) {
+    return _InterlockedCompareExchange((volatile long *)p, (long)desired, (long)expected) == (long)expected;
+}
+
 #else
 
 static inline unsigned char ud_exchange_u8(unsigned char *p, unsigned char v) {
@@ -56,6 +72,13 @@ static inline void ud_store_release_u32(uint32_t *p, uint32_t v) {
 
 static inline void ud_fence_acquire(void) { __atomic_thread_fence(__ATOMIC_ACQUIRE); }
 static inline void ud_fence_release(void) { __atomic_thread_fence(__ATOMIC_RELEASE); }
+static inline void ud_fence_full(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+
+/* Compare the 4 bytes at p with expected. If they are equal, write desired and return 1.
+   Otherwise return 0. The values are raw memory, so byte order does not matter. */
+static inline int ud_cmpxchg_u32(uint32_t *p, uint32_t expected, uint32_t desired) {
+    return __atomic_compare_exchange_n(p, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
 
 #endif
 
