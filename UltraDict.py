@@ -595,7 +595,7 @@ class UltraDict(collections.UserDict, FastCore):
         'serializer', 'recurse', 'fast_lock', 'use_marshal'
 
     __slots__ = python_attrs(STATUS_ATTRS + ('fast_lock', 'use_marshal', 'buffer_remote', 'buffer_pointer_remote',
-        'full_dump_cache'), CORE_ATTRS)
+        'full_dump_cache', 'update_stream_position_bytes_remote', 'full_dump_counter_bytes_remote'), CORE_ATTRS)
 
     # True if the C extension module `_fast` is used
     accelerated = ACCELERATED
@@ -806,6 +806,10 @@ class UltraDict(collections.UserDict, FastCore):
         else:
             self.update_stream_position_remote = self.control.buf[ 0:  4].cast('I')
             self.full_dump_counter_remote      = self.control.buf[10: 14].cast('I')
+            if PYPY:
+                # The same two counters as bytes, see `changed()`
+                self.update_stream_position_bytes_remote = self.control.buf[ 0:  4]
+                self.full_dump_counter_bytes_remote      = self.control.buf[10: 14]
         self.lock_pid_remote               = self.control.buf[ 4:  8]
         self.lock_remote                   = self.control.buf[ 8: 10]
         self.full_dump_static_size_remote  = self.control.buf[14: 18]
@@ -1165,61 +1169,67 @@ class UltraDict(collections.UserDict, FastCore):
         Raises AssertionError on a bad record.
         """
         # Read the counters from `self` each time, never from local variables, see `init_remotes()`
-
-        # Remember start position in the update stream
         pos = self.update_stream_position
-        #log.debug("Apply update: stream position own={} remote={} full_dump_counter={}", pos, remote_position[0], self.full_dump_counter)
+        if pos >= self.update_stream_position_remote[0]:
+            return False
 
-        buf = self.buffer_remote
-        data = self.data
-        loads = None
+        # Apply the first record before the loop. Most of the time, only one record is new, and
+        # the PyPy JIT compiles a loop that runs only once to much slower code.
+        pos = self.replay_record(pos)
+        while pos >= 0:
+            if pos >= self.update_stream_position_remote[0]:
+                return False
+            pos = self.replay_record(pos)
+        return True
 
-        # Iterate over all updates until the start of the last update
-        while pos < self.update_stream_position_remote[0]:
-            # Read header, it is a marker byte, 4 bytes of length and a FF byte
-            marker, length, checksum, end_marker = HEADER.unpack_from(buf, pos)
-            if end_marker != 0xFF:
-                raise AssertionError(f"Bad header in update stream at position {pos}")
-            pos += HEADER_SIZE
-            # The cffi copy below does not check the bounds of the buffer
-            if length > self.buffer_size - pos:
-                raise AssertionError(f"Bad length in update stream at position {pos - HEADER_SIZE}")
-            #log.debug("Found update, update_stream_position={} length={}", self.update_stream_position, length + 6)
+    def replay_record(self, pos):
+        """
+        Apply the record at position `pos` of the update stream to the local copy.
 
-            # Copy the record, then check that no new full dump appeared meanwhile.
-            # Writers only overwrite the stream after a new full dump, so the copy is valid.
-            if PYPY_CFFI:
-                record = ffi.unpack(self.buffer_pointer_remote + pos, length)
-            else:
-                record = bytes(buf[pos:pos+length])
-            if self.full_dump_counter != self.full_dump_counter_remote[0]:
-                return True
+        Returns the position after the record, or -1 if a new full dump appeared while reading.
+        Raises AssertionError on a bad record.
+        """
+        # Read header, it is a marker byte, 4 bytes of length, the CRC32 and a FF byte
+        marker, length, checksum, end_marker = HEADER.unpack_from(self.buffer_remote, pos)
+        if end_marker != 0xFF:
+            raise AssertionError(f"Bad header in update stream at position {pos}")
+        start = pos
+        pos += HEADER_SIZE
+        # The cffi copy below does not check the bounds of the buffer
+        if length > self.buffer_size - pos:
+            raise AssertionError(f"Bad length in update stream at position {start}")
 
-            # Never parse a record that is not complete, see HEADER
-            if zlib.crc32(record, self.full_dump_counter & 0xFFFFFFFF) != checksum:
-                raise AssertionError(f"Bad checksum in update stream at position {pos - HEADER_SIZE}")
+        # Copy the record, then check that no new full dump appeared meanwhile.
+        # Writers only overwrite the stream after a new full dump, so the copy is valid.
+        if PYPY_CFFI:
+            record = ffi.unpack(self.buffer_pointer_remote + pos, length)
+        else:
+            record = bytes(self.buffer_remote[pos:pos+length])
+        if self.full_dump_counter != self.full_dump_counter_remote[0]:
+            return -1
 
-            # Unserialize the update data, we expect a tuple of mode, key and value
-            if marker == MARKER_MARSHAL:
-                mode, key, value = marshal.loads(record)
-            elif marker == MARKER_SERIALIZER:
-                if loads is None:
-                    loads = self.serializer.loads
-                mode, key, value = loads(record)
-            else:
-                raise AssertionError(f"Bad header in update stream at position {pos - HEADER_SIZE}")
+        # Never parse a record that is not complete, see HEADER
+        if zlib.crc32(record, self.full_dump_counter & 0xFFFFFFFF) != checksum:
+            raise AssertionError(f"Bad checksum in update stream at position {start}")
 
-            # Update or local dict cache (in our parent).
-            # A delete can be applied twice when two threads read through the same UltraDict.
-            if mode:
-                data[key] = value
-            else:
-                data.pop(key, None)
-            pos += length
-            # Remember that we have applied the update
-            self.update_stream_position = pos
+        # Unserialize the update data, we expect a tuple of mode, key and value
+        if marker == MARKER_MARSHAL:
+            mode, key, value = marshal.loads(record)
+        elif marker == MARKER_SERIALIZER:
+            mode, key, value = self.serializer.loads(record)
+        else:
+            raise AssertionError(f"Bad header in update stream at position {start}")
 
-        return False
+        # Update or local dict cache (in our parent).
+        # A delete can be applied twice when two threads read through the same UltraDict.
+        if mode:
+            self.data[key] = value
+        else:
+            self.data.pop(key, None)
+        pos += length
+        # Remember that we have applied the update
+        self.update_stream_position = pos
+        return pos
 
     def update(self, other=None, *args, **kwargs):
         # pylint: disable=arguments-differ, keyword-arg-before-vararg
@@ -1295,16 +1305,31 @@ class UltraDict(collections.UserDict, FastCore):
     else:
         replay_stream = replay_stream_python
 
-        def changed(self):
-            """
-            True if the stream position or the full dump counter differ from ours.
-            Also True after `close()`, then `apply_update()` raises AlreadyClosed.
-            """
-            try:
-                return self.update_stream_position != self.update_stream_position_remote[0] \
-                    or self.full_dump_counter != self.full_dump_counter_remote[0]
-            except AttributeError:
-                return True
+        if PYPY and not PYPY_CFFI:
+            def changed(self):
+                """
+                True if the stream position or the full dump counter differ from ours.
+                Also True after `close()`, then `apply_update()` raises AlreadyClosed.
+
+                On PyPy without cffi, `int.from_bytes()` is faster than an index into a cast
+                memoryview. The counters use the native byte order, see `init_remotes()`.
+                """
+                try:
+                    return self.update_stream_position != int.from_bytes(self.update_stream_position_bytes_remote, sys.byteorder) \
+                        or self.full_dump_counter != int.from_bytes(self.full_dump_counter_bytes_remote, sys.byteorder)
+                except AttributeError:
+                    return True
+        else:
+            def changed(self):
+                """
+                True if the stream position or the full dump counter differ from ours.
+                Also True after `close()`, then `apply_update()` raises AlreadyClosed.
+                """
+                try:
+                    return self.update_stream_position != self.update_stream_position_remote[0] \
+                        or self.full_dump_counter != self.full_dump_counter_remote[0]
+                except AttributeError:
+                    return True
 
         def __delitem__(self, key):
             #log.debug("__delitem__ {}", key)

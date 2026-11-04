@@ -144,23 +144,23 @@ Time per operation on Python 3.13, Linux x86_64, with simple keys and values and
 
 | Operation | Before the C extension | Pure Python | C extension |
 |---|---|---|---|
-| Read `u[1]` | 228 ns | 99 ns | 28 ns |
-| Read `u.get(1)` | 521 ns | 106 ns | 38 ns |
-| `1 in u` | 222 ns | 108 ns | 27 ns |
-| Write `u[1] = 1` | 1,986 ns | 743 ns | 105 ns |
-| Write, then read in a second instance | 3,793 ns | 1,626 ns | 259 ns |
-| Write with `shared_lock=True` | 14,166 ns | 2,165 ns | 91 ns |
+| Read `u[1]` | 228 ns | 87 ns | 27 ns |
+| Read `u.get(1)` | 521 ns | 93 ns | 36 ns |
+| `1 in u` | 222 ns | 104 ns | 28 ns |
+| Write `u[1] = 1` | 1,986 ns | 749 ns | 109 ns |
+| Write, then read in a second instance | 3,793 ns | 1,637 ns | 254 ns |
+| Write with `shared_lock=True` | 14,166 ns | 1,980 ns | 85 ns |
 
 Time per operation on PyPy 3.11, Linux x86_64, with the same keys, values and `buffer_size`:
 
-| Operation | Before cffi | cffi |
-|---|---|---|
-| Read `u[1]` | 33 ns | 4.0 ns |
-| Read `u.get(1)` | 34 ns | 4.2 ns |
-| `1 in u` | 36 ns | 4.3 ns |
-| Write `u[1] = 1` | 1,060 ns | 140 ns |
-| Write, then read in a second instance | 1,629 ns | 452 ns |
-| Write with `shared_lock=True` | Fails, see the bug fixes below | 180 ns |
+| Operation | Before cffi | Pure Python | cffi |
+|---|---|---|---|
+| Read `u[1]` | 33 ns | 33 ns | 4.5 ns |
+| Read `u.get(1)` | 34 ns | 33 ns | 4.5 ns |
+| `1 in u` | 36 ns | 33 ns | 4.4 ns |
+| Write `u[1] = 1` | 1,060 ns | 589 ns | 134 ns |
+| Write, then read in a second instance | 1,629 ns | 1,051 ns | 264 ns |
+| Write with `shared_lock=True` | Fails, see the bug fixes below | 674 ns | 181 ns |
 
 With the default `buffer_size` of 10,000 bytes, a full dump happens every few hundred small writes. A bigger `buffer_size`, e.g. `1_000_000`, makes full dumps rarer and writes faster.
 
