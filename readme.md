@@ -112,6 +112,33 @@ Back in the first Python REPL:
 1
 ```
 
+## C extension
+
+UltraDict includes an optional C extension, `_fast`, that is built with Cython when you install the package. It moves the hot paths out of the Python interpreter: reads, writes, the replay of the update stream and the shared lock. UltraDict uses it automatically when it is available. Without it, UltraDict uses its pure Python implementation with the same behavior.
+
+Check which implementation is active:
+
+```python
+>>> from UltraDict import UltraDict
+>>> UltraDict.accelerated
+True
+```
+
+Set the environment variable `ULTRADICT_PURE_PYTHON=1` to use the pure Python implementation. Processes with and without the C extension can share the same UltraDict.
+
+Time per operation on Python 3.13, Linux x86_64, with simple keys and values and the default `buffer_size`:
+
+| Operation | Before the C extension | Pure Python | C extension |
+|---|---|---|---|
+| Read `u[1]` | 204 ns | 90 ns | 21 ns |
+| Read `u.get(1)` | 474 ns | 113 ns | 32 ns |
+| `1 in u` | 220 ns | 114 ns | 21 ns |
+| Write `u[1] = 1` | 1,866 ns | 797 ns | 219 ns |
+| Write, then read in a second instance | 3,952 ns | 1,678 ns | 484 ns |
+| Write with `shared_lock=True` | 14,031 ns | 1,927 ns | 130 ns |
+
+With the default `buffer_size` of 10,000 bytes, a full dump happens every few hundred small writes. With `buffer_size=1_000_000`, a write takes about 95 ns and a write with `shared_lock=True` about 65 ns.
+
 ## Performance comparison
 
 Lets compare a classical Python dict, UltraDict, multiprocessing.Manager and Redis.
@@ -242,6 +269,8 @@ dict will automatically load the full dump and continue streaming updates.
 
 `serializer`: Use a different serialized from the default pickle, e. g. marshal, dill, jsons.
 The module or object provided must support the methods *loads()* and *dumps()*
+
+With the default pickle serializer, UltraDict streams updates with simple keys and values (`int`, `float`, `str`, `bytes`, `bool` and `None`) with `marshal`, because it is several times faster. All other updates and all full dumps use pickle. All processes that share an UltraDict must use the same version of UltraDict.
 
 `shared_lock`: When writing to the same dict at the same time from multiple, independent processes,
 they need a shared lock to synchronize and not overwrite each other's changes. Shared locks are slow.
@@ -416,3 +445,20 @@ Other things you can do:
 ## Contributing
 
 Contributions are always welcome!
+
+Run the tests with and without the C extension:
+
+```bash
+python setup.py build_ext --inplace
+python -m unittest
+ULTRADICT_PURE_PYTHON=1 python -m unittest
+```
+
+`tests/api_check.py` calls every part of the public API and prints one line for each step. `tests/api_check_expected.txt` holds the output of the original implementation with the bug fixes below. The test `test_api_behavior_unchanged` fails if any step behaves differently.
+
+These bug fixes change the behavior of the original implementation:
+
+* A change that cannot be serialized, e.g. a lambda as a value, raises the serialization error and changes nothing. Before, it changed the local copy but not the copies of other processes.
+* `UltraDict.SharedLock.reset()` releases the lock. Before, it always raised `ValueError`.
+* Deleting a key works with every serializer. Delete records now use `None` as their value. Before, they used `b''`, which a JSON serializer cannot write.
+* Only the UltraDict that created the recurse register unlinks the nested UltraDicts when it closes. Before, an UltraDict that only used the register of another UltraDict (`recurse_register`), or a nested UltraDict on `unlink()`, unlinked the whole tree. The owner then failed to close with `CannotAttachSharedMemory`.

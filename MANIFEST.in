@@ -1,0 +1,2 @@
+include readme.md LICENSE requirements.txt
+include _fast.pyx _fast_atomic.h
