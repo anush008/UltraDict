@@ -21,7 +21,7 @@
 __all__ = ['UltraDict']
 
 import multiprocessing, multiprocessing.shared_memory, multiprocessing.synchronize
-import collections, os, pickle, sys, time, weakref
+import collections, marshal, os, pickle, struct, sys, time, weakref
 import importlib.util, importlib.machinery
 
 try:
@@ -70,7 +70,92 @@ def remove_shm_from_resource_tracker():
 #More details at: https://bugs.python.org/issue38119
 remove_shm_from_resource_tracker()
 
-class UltraDict(collections.UserDict, dict):
+# Header of each record in the update stream and in the full dump memory:
+# one marker byte, 4 bytes little endian length of the body, one FF byte
+HEADER = struct.Struct('<BIB')
+HEADER_SIZE = HEADER.size
+
+# The first byte of a record header tells how its body is serialized.
+# Full dumps always use MARKER_SERIALIZER.
+MARKER_SERIALIZER = 0xFF  # The serializer of the UltraDict, by default pickle
+MARKER_MARSHAL    = 0xFE  # marshal, only used for simple types instead of pickle
+
+# With the default pickle serializer, updates with keys and values of exactly these
+# types use marshal, which is several times faster than pickle and gives the same result.
+MARSHAL_TYPES = frozenset((int, float, str, bytes, bool, type(None)))
+# Fixed marshal format version, so processes with different Python versions can read it
+MARSHAL_VERSION = 4
+
+# Value of a delete record in the update stream. Readers ignore it.
+# None works with every serializer, e.g. also with JSON.
+DELETED = None
+
+# Optional C implementation of the hot paths, see _fast.pyx.
+# Set the environment variable ULTRADICT_PURE_PYTHON=1 to disable it.
+ACCELERATED = False
+if not os.environ.get('ULTRADICT_PURE_PYTHON'):
+    try:
+        from . import _fast
+        if getattr(_fast, 'VERSION', None) == 1:
+            ACCELERATED = True
+    except ImportError:
+        pass
+
+if ACCELERATED:
+    FastCore = _fast.FastCore
+    SharedLockCore = _fast.SharedLockCore
+else:
+    FastCore = dict
+    class SharedLockCore():
+        __slots__ = ()
+
+def make_fast_exchange(atomic):
+    """
+    Return a function `exchange(desired) -> old` that atomically swaps a single byte
+    in shared memory and returns the old value. `desired` must be 0 or 1.
+
+    Only used without the C extension module `_fast`.
+
+    The public API of the `atomics` package allocates two cffi buffers on every call,
+    which costs several microseconds. This function calls the same underlying C function
+    of `atomics` directly with preallocated arguments instead.
+
+    Returns None if the internals of `atomics` do not match, so the caller can fall back
+    to the public API.
+    """
+    # pylint: disable=protected-access
+    try:
+        import ctypes, cffi, threading
+        from atomics._impl.enums import OpType, MemoryOrder
+        fp_exchange = atomic._core.get_op_func(OpType.EXCHANGE)
+        if fp_exchange is None or atomic._core.width != 1:
+            return None
+        ffi = cffi.FFI()
+        c_exchange = ffi.cast("void(*)(void *, const void *, int, void *)", ctypes.cast(fp_exchange, ctypes.c_void_p).value)
+        address = ffi.cast("void *", atomic._core.address)
+        values = (ffi.new("unsigned char[1]", [0]), ffi.new("unsigned char[1]", [1]))
+        order = int(MemoryOrder.SEQ_CST)
+    except Exception: # pylint: disable=broad-except
+        return None
+
+    # The C call releases the GIL, so each thread needs its own result buffer
+    local = threading.local()
+
+    def exchange(desired):
+        try:
+            result = local.result
+        except AttributeError:
+            result = local.result = ffi.new("unsigned char[1]")
+        c_exchange(address, values[desired], order, result)
+        return result[0]
+
+    return exchange
+
+def python_attrs(attrs, core_attrs):
+    """ The attributes that need a slot in a Python class, without the ones in the C base class """
+    return tuple(attr for attr in attrs if not (ACCELERATED and attr in core_attrs))
+
+class UltraDict(collections.UserDict, FastCore):
 
     Exceptions = Exceptions
     log = log
@@ -79,7 +164,7 @@ class UltraDict(collections.UserDict, dict):
         """ Not yet used """
         pass
 
-    class SharedLock():
+    class SharedLock(SharedLockCore):
         """
         Lock stored in shared_memory to provide an additional layer of protection,
         e.g. when using spawned processes.
@@ -89,9 +174,10 @@ class UltraDict(collections.UserDict, dict):
         This is needed if you write to the shared memory with independent processes.
         """
 
-        __slots__ = 'parent', 'has_lock',  'ctx', 'lock_atomic', 'lock_remote', \
+        # With the C extension, `has_lock`, `pid` and `next_acquire_parameters` live in SharedLockCore
+        __slots__ = python_attrs(('parent', 'has_lock',  'ctx', 'lock_atomic', 'lock_remote', \
             'pid', 'pid_bytes', 'pid_remote', 'pid_remote_ctx', 'pid_remote_atomic', \
-            'next_acquire_parameters'
+            'next_acquire_parameters', 'exchange'), ('has_lock', 'pid', 'next_acquire_parameters', 'exchange'))
 
         def __init__(self, parent, lock_name, pid_name):
             self.has_lock = 0
@@ -113,6 +199,12 @@ class UltraDict(collections.UserDict, dict):
                 raise e
             self.lock_atomic = self.ctx.__enter__()
             self.pid_remote_atomic = self.pid_remote_ctx.__enter__()
+
+            if ACCELERATED:
+                # The C base class works on the lock byte and the PID bytes directly
+                self._bind(self.lock_remote, self.pid_remote)
+            else:
+                self.exchange = make_fast_exchange(self.lock_atomic) or self.exchange_public_api
 
             def after_fork():
                 if self.has_lock:
@@ -166,15 +258,18 @@ class UltraDict(collections.UserDict, dict):
             if timeout:
                 return self.acquire_with_timeout(sleep_time=sleep_time, timeout=timeout, steal_after_timeout=steal_after_timeout)
 
+            exchange = self.exchange
+
             while True:
                 # We need both, the shared lock to be False and the lock_pid to be 0
-                if self.test_and_inc():
+                # Inlined version of `test_and_inc()`
+                if exchange(1) == 0:
 
                     assert self.has_lock == 0
                     self.has_lock = 1
 
                     # If nobody had owned the lock, so the remote pid should be zero
-                    assert self.pid_remote[0:4] == b'\x00\x00\x00\x00'
+                    assert self.pid_remote == b'\x00\x00\x00\x00'
 
                     self.pid_remote[:] = self.pid_bytes
                     return True
@@ -188,42 +283,62 @@ class UltraDict(collections.UserDict, dict):
                 if not block:
                     raise Exceptions.CannotAcquireLock(blocking_pid=self.get_remote_pid())
 
-        #@profile
-        def test_and_inc(self):
-            old = self.lock_atomic.exchange(b'\x01')
-            if old != b'\x00':
-                # Oops, someone else was faster than us
-                return False
-            return True
+        def exchange_public_api(self, desired):
+            """ Slow fallback for `exchange()` if `make_fast_exchange()` cannot be used """
+            return self.lock_atomic.exchange(b'\x01' if desired else b'\x00')[0]
 
-        #@profile
-        def test_and_dec(self):
-            old = self.lock_atomic.exchange(b'\x00')
-            if old != b'\x01':
-                raise Exception("Failed to release lock")
-            return True
+        if not ACCELERATED:
+            # With the C extension, SharedLockCore provides these methods
 
-        #@profile
-        def release(self, *args):
-            #log.debug("Release lock, lock={}", self.has_lock)
-            if self.has_lock > 0:
-                owner = int.from_bytes(self.pid_remote, 'little')
-                if owner != self.pid:
-                    raise Exception(f"Our lock for pid {self.pid} was stolen by pid {owner}")
-                self.has_lock -= 1
-                # Last local lock released, release shared lock
-                if not self.has_lock:
-                    self.pid_remote[:] = b'\x00\x00\x00\x00'
-                    self.test_and_dec()
-                #log.debug("Relased lock, lock={} pid_remote={}", self.has_lock, int.from_bytes(self.pid_remote, 'little'))
+            #@profile
+            def test_and_inc(self):
+                if self.exchange(1) != 0:
+                    # Oops, someone else was faster than us
+                    return False
                 return True
 
-            return False
+            #@profile
+            def test_and_dec(self):
+                if self.exchange(0) != 1:
+                    raise Exception("Failed to release lock")
+                return True
+
+            #@profile
+            def release(self, *args):
+                #log.debug("Release lock, lock={}", self.has_lock)
+                if self.has_lock > 0:
+                    if self.pid_remote != self.pid_bytes:
+                        owner = int.from_bytes(self.pid_remote, 'little')
+                        raise Exception(f"Our lock for pid {self.pid} was stolen by pid {owner}")
+                    self.has_lock -= 1
+                    # Last local lock released, release shared lock
+                    if not self.has_lock:
+                        self.pid_remote[:] = b'\x00\x00\x00\x00'
+                        self.test_and_dec()
+                    #log.debug("Relased lock, lock={} pid_remote={}", self.has_lock, int.from_bytes(self.pid_remote, 'little'))
+                    return True
+
+                return False
+
+            def __enter__(self):
+                if self.next_acquire_parameters:
+                    self.acquire(*self.next_acquire_parameters)
+                    self.reset_acquire_parameters()
+                else:
+                    self.acquire()
+                return self
+
+            def __exit__(self, type, value, traceback):
+                self.release()
+                # Make sure exceptions are not ignored
+                return False
 
         def reset(self):
-            # Risky
-            self.lock_remote[:] = b'\x00'
+            # Risky, releases the lock even if another process holds it.
+            # Clear the PID first, so a process that takes the lock next finds no stale PID.
             self.pid_remote[:] = b'\x00\x00\x00\x00'
+            # The lock is the first byte of `lock_remote`
+            self.lock_remote[0:1] = b'\x00'
             self.has_lock = 0
 
         def reset_acquire_parameters(self):
@@ -290,6 +405,12 @@ class UltraDict(collections.UserDict, dict):
             pprint.pprint(status)
 
         def cleanup(self):
+            # The fast exchange holds the raw address of the shared memory,
+            # it must never be used after the memory is released
+            if ACCELERATED:
+                self._unbind()
+            elif hasattr(self, 'exchange'):
+                del self.exchange
             if hasattr(self, 'ctx'):
                 self.ctx.__exit__(None, None, None)
                 del self.ctx
@@ -314,22 +435,13 @@ class UltraDict(collections.UserDict, dict):
         def __repr__(self):
             return f"{self.__class__.__name__} @{hex(id(self))} lock_remote={int.from_bytes(self.lock_remote, 'little')}, has_lock={self.has_lock}, pid={self.pid}), pid_remote={int.from_bytes(self.pid_remote, 'little')}"
 
-        def __enter__(self):
-            self.acquire(*self.next_acquire_parameters)
-            self.reset_acquire_parameters()
-            return self
-
-        def __exit__(self, type, value, traceback):
-            self.release()
-            # Make sure exceptions are not ignored
-            return False
-
         def __call__(self, block=True, timeout=None, sleep_time=0.000001, steal_after_timeout=False):
             self.next_acquire_parameters = ( block, timeout, sleep_time, steal_after_timeout )
 
             return self
 
-    __slots__ = 'name', 'control', 'buffer', 'buffer_size', 'lock', 'shared_lock', \
+    # The attributes that `status()` shows
+    STATUS_ATTRS = 'name', 'control', 'buffer', 'buffer_size', 'lock', 'shared_lock', \
         'update_stream_position', 'update_stream_position_remote', \
         'full_dump_counter', 'full_dump_memory', 'full_dump_size', \
         'serializer', \
@@ -342,6 +454,15 @@ class UltraDict(collections.UserDict, dict):
         'full_dump_memory_name_remote', \
         'data', 'closed', 'auto_unlink', \
         'finalizer'
+
+    # With the C extension, these attributes live in FastCore
+    CORE_ATTRS = 'data', 'update_stream_position', 'full_dump_counter', 'buffer_size', \
+        'serializer', 'recurse', 'fast_lock', 'use_marshal'
+
+    __slots__ = python_attrs(STATUS_ATTRS + ('fast_lock', 'use_marshal', 'buffer_remote'), CORE_ATTRS)
+
+    # True if the C extension module `_fast` is used
+    accelerated = ACCELERATED
 
     def __init__(self, *args, name=None, create=None, buffer_size=10_000, serializer=pickle, shared_lock=None, full_dump_size=None,
             auto_unlink=None, recurse=None, recurse_register=None, **kwargs):
@@ -388,11 +509,21 @@ class UltraDict(collections.UserDict, dict):
         self.init_remotes()
 
         self.serializer = serializer
+        # Fast path for simple types, see MARSHAL_TYPES
+        self.use_marshal = serializer is pickle
 
         # Actual stream buffer that contains marshalled data of changes to the dict
         self.buffer = self.get_memory(create=create, name=self.name + '_memory', size=buffer_size)
         # TODO: Raise exception if buffer size mismatch
         self.buffer_size = self.buffer.size
+        # Keep a direct reference to the memory view of the stream buffer,
+        # `SharedMemory.buf` is a property and slower to access
+        self.buffer_remote = self.buffer.buf
+        if ACCELERATED:
+            # The C base class reads and writes the control memory and the stream buffer directly
+            self._bind(self.control.buf, self.buffer.buf)
+            # The C base class may replay the stream itself, unless a subclass changes apply_update()
+            self.direct_replay = type(self).apply_update is UltraDict.apply_update
 
         self.full_dump_memory = None
 
@@ -457,6 +588,11 @@ class UltraDict(collections.UserDict, dict):
         else:
             self.lock = multiprocessing.RLock()
 
+        # Lock for internal use. For the RLock, we use the underlying C level semaphore
+        # directly because the Python wrapper of RLock doubles the cost of each acquire
+        # and release. Both refer to the same semaphore, so they can be mixed freely.
+        self.fast_lock = getattr(self.lock, '_semlock', self.lock)
+
         self.shared_lock = shared_lock
 
         # Parameters that could be read from remote if we are connecting to an existing UltraDict
@@ -513,10 +649,15 @@ class UltraDict(collections.UserDict, dict):
 
     def init_remotes(self):
         # Memoryviews to the right buffer position in self.control
-        self.update_stream_position_remote = self.control.buf[ 0:  4]
+
+        # The two counters that are checked on every access are cast to an unsigned
+        # 4 bytes integer, so reading them is a simple index access, e.g.
+        # `self.update_stream_position_remote[0]`. They use the native byte order.
+        # This is safe because shared memory never leaves the machine.
+        self.update_stream_position_remote = self.control.buf[ 0:  4].cast('I')
         self.lock_pid_remote               = self.control.buf[ 4:  8]
         self.lock_remote                   = self.control.buf[ 8: 10]
-        self.full_dump_counter_remote      = self.control.buf[10: 14]
+        self.full_dump_counter_remote      = self.control.buf[10: 14].cast('I')
         self.full_dump_static_size_remote  = self.control.buf[14: 18]
         self.shared_lock_remote            = self.control.buf[18: 19]
         self.recurse_remote                = self.control.buf[19: 20]
@@ -574,7 +715,7 @@ class UltraDict(collections.UserDict, dict):
     def dump(self):
         """ Dump the full dict into shared memory """
 
-        with self.lock:
+        with self.fast_lock:
             old = bytes(self.full_dump_memory_name_remote).decode('utf-8').strip().strip('\x00')
 
             self.apply_update()
@@ -619,15 +760,17 @@ class UltraDict(collections.UserDict, dict):
             if not (self.full_dump_size and self.full_dump_memory):
                 self.full_dump_memory_name_remote[:] = full_dump_memory.name.encode('utf-8').ljust(255)
 
-            self.full_dump_counter += 1
-            current = int.from_bytes(self.full_dump_counter_remote, 'little')
-            # Now also increment the remote counter
-            self.full_dump_counter_remote[:] = int(current + 1).to_bytes(4, 'little')
-
             # Reset the stream position to zero as we have
-            # just provided a fresh new full dump
+            # just provided a fresh new full dump.
+            # This must happen before the counter is incremented: a reader that sees the new
+            # counter loads the full dump and then must not replay old records of the stream.
             self.update_stream_position = 0
-            self.update_stream_position_remote[:] = b'\x00\x00\x00\x00'
+            self.update_stream_position_remote[0] = 0
+
+            self.full_dump_counter += 1
+            current = self.full_dump_counter_remote[0]
+            # Now also increment the remote counter
+            self.full_dump_counter_remote[0] = current + 1
 
             #log.info("Dumped dict with {} elements to {} bytes, remote_counter={}", len(self), len(marshalled), current+1)
 
@@ -660,7 +803,7 @@ class UltraDict(collections.UserDict, dict):
                 return self.get_full_dump_memory(max_retry=max_retry, retry=retry+1)
             elif retry == max_retry:
                 # On the last retry, let's use a lock to ensure we can safely import the dump
-                with self.lock:
+                with self.fast_lock:
                     return self.get_full_dump_memory(max_retry=max_retry, retry=retry+1)
             else:
                 raise e
@@ -673,7 +816,7 @@ class UltraDict(collections.UserDict, dict):
         There is a rare case where a full dump is replaced with a newer full dump while
         we didn't have the chance to load the old one. In this case, we just retry.
         """
-        full_dump_counter = int.from_bytes(self.full_dump_counter_remote, 'little')
+        full_dump_counter = self.full_dump_counter_remote[0]
         #log.debug("Loading full dump local_counter={} remote_counter={}", self.full_dump_counter, full_dump_counter)
         try:
             if force or (self.full_dump_counter < full_dump_counter):
@@ -707,7 +850,7 @@ class UltraDict(collections.UserDict, dict):
             else:
                 raise Exception("Cannot load full dump, no new data available")
         except AssertionError as e:
-            full_dump_delta = int.from_bytes(self.full_dump_counter_remote, 'little') - self.full_dump_counter
+            full_dump_delta = self.full_dump_counter_remote[0] - self.full_dump_counter
             if full_dump_delta > 1:
                 # If more than one new full dump was created during the time we were trying to load one full dump
                 # it can happen that our full dump has just disappeared
@@ -724,85 +867,136 @@ class UltraDict(collections.UserDict, dict):
         # If mode is 1, it means update the key
         #mode = not delete
         marshalled = self.serializer.dumps((not delete, key, item))
+
+        with self.fast_lock:
+            self.append_marshalled(MARKER_SERIALIZER, marshalled, key, item, delete)
+
+    def serialize_update(self, mode, key, item):
+        """
+        Serialize one change for the update stream.
+
+        Returns the header marker byte and the serialized change.
+        """
+        if self.use_marshal and type(key) in MARSHAL_TYPES and type(item) in MARSHAL_TYPES:
+            return MARKER_MARSHAL, marshal.dumps((mode, key, item), MARSHAL_VERSION)
+        return MARKER_SERIALIZER, self.serializer.dumps((mode, key, item))
+
+    #@profile
+    def append_marshalled(self, marker, marshalled, key, item, delete):
+        """
+        Append an already serialized change to the shared memory stream.
+        `marker` tells how `marshalled` was serialized, see MARKER_SERIALIZER and MARKER_MARSHAL.
+
+        The caller must hold the lock.
+        """
         length = len(marshalled)
+        start_position = self.update_stream_position_remote[0]
+        end_position = start_position + HEADER_SIZE + length
+        #log.debug("Update start from={} len={}", start_position, length)
+        if end_position > self.buffer_size:
+            #log.debug("Buffer is full")
 
-        with self.lock:
-            start_position = int.from_bytes(self.update_stream_position_remote, 'little')
-            # 6 bytes for the header
-            end_position = start_position + length + 6
-            #log.debug("Update start from={} len={}", start_position, length)
-            if end_position > self.buffer_size:
-                #log.debug("Buffer is full")
+            # todo: is is necessary? apply_update() is also done inside dump()
+            self.apply_update()
+            if not delete:
+                self.data.__setitem__(key, item)
+            self.dump()
+            return
 
-                # todo: is is necessary? apply_update() is also done inside dump()
-                self.apply_update()
-                if not delete:
-                    self.data.__setitem__(key, item)
-                self.dump()
-                return
+        # Write header and body directly into the shared memory, without
+        # concatenating them in a temporary bytes object first
+        buf = self.buffer_remote
+        HEADER.pack_into(buf, start_position, marker, length, 0xFF)
+        buf[start_position + HEADER_SIZE:end_position] = marshalled
 
-            marshalled = b'\xFF' + length.to_bytes(4, 'little') + b'\xFF' + marshalled
-
-            # Write body with the real data
-            self.buffer.buf[start_position:end_position] = marshalled
-
-            # Inform others about it
-            self.update_stream_position = end_position
-            self.update_stream_position_remote[:] = end_position.to_bytes(4, 'little')
-            #log.debug("Update end to={} buffer_size={} ", end_position, self.buffer_size)
+        # Inform others about it, only after the full record is written
+        self.update_stream_position = end_position
+        self.update_stream_position_remote[0] = end_position
+        #log.debug("Update end to={} buffer_size={} ", end_position, self.buffer_size)
 
     #@profile
     def apply_update(self):
         """ Opportunistically apply dict changes from shared memory stream without any locking.  """
 
-        if self.full_dump_counter < int.from_bytes(self.full_dump_counter_remote, 'little'):
+        if self.full_dump_counter < self.full_dump_counter_remote[0]:
             self.load(force=True)
 
-        if self.update_stream_position < int.from_bytes(self.update_stream_position_remote, 'little'):
-
-            # Remember start position in the update stream
-            pos = self.update_stream_position
-            #log.debug("Apply update: stream position own={} remote={} full_dump_counter={}", pos, int.from_bytes(self.update_stream_position_remote, 'little'), self.full_dump_counter)
-
+        if self.update_stream_position < self.update_stream_position_remote[0]:
             try:
-                # Iterate over all updates until the start of the last update
-                while pos < int.from_bytes(self.update_stream_position_remote, 'little'):
-                    # Read header
-                    # The first byte should be a FF byte to introduce the header
-                    assert bytes(self.buffer.buf[pos:pos+1]) == b'\xFF'
-                    pos += 1
-                    # Then comes 4 bytes of length
-                    length = int.from_bytes(bytes(self.buffer.buf[pos:pos+4]), 'little')
-                    pos += 4
-                    #log.debug("Found update, update_stream_position={} length={}", self.update_stream_position, length + 6)
-                    assert bytes(self.buffer.buf[pos:pos+1]) == b'\xFF'
-                    pos += 1
-                    # Unserialize the update data, we expect a tuple of key and value
-                    mode, key, value = self.serializer.loads(bytes(self.buffer.buf[pos:pos+length]))
-                    # Update or local dict cache (in our parent)
-                    if mode:
-                        self.data.__setitem__(key, value)
-                    else:
-                        self.data.__delitem__(key)
-                    pos += length
-                    # Remember that we have applied the update
-                    self.update_stream_position = pos
-            except (AssertionError, pickle.UnpicklingError) as e:
+                if self.replay_stream():
+                    # A new full dump appeared while we were reading the stream
+                    return self.apply_update()
+            except (AssertionError, struct.error, pickle.UnpicklingError, EOFError, ValueError) as e:
+                # EOFError and ValueError come from marshal on a damaged record
 
                 # It can happen that a slow process is not fast enough reading the stream and some
                 # other process already got around overwriting the current position. It is possible to
                 # recover from this situation if and only if a new, fresh full dump exists that can be loaded.
-                if self.full_dump_counter < int.from_bytes(self.full_dump_counter_remote, 'little'):
-                    log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={int.from_bytes(self.full_dump_counter_remote, 'little')}. Consider increasing buffer_size.")
+                if self.full_dump_counter < self.full_dump_counter_remote[0]:
+                    log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
                     return self.apply_update()
 
                 # As a last resort, let's get a lock. This way we are safe but slow.
-                with self.lock:
-                    if self.full_dump_counter < int.from_bytes(self.full_dump_counter_remote, 'little'):
-                        log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={int.from_bytes(self.full_dump_counter_remote, 'little')}. Consider increasing buffer_size.")
+                with self.fast_lock:
+                    if self.full_dump_counter < self.full_dump_counter_remote[0]:
+                        log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
                         return self.apply_update()
 
                 raise e
+
+    def replay_stream_python(self):
+        """
+        Apply all new records of the update stream to the local copy.
+
+        Returns True if a new full dump appeared while reading. The caller must then load it.
+        Raises AssertionError on a bad record.
+        """
+        remote_position = self.update_stream_position_remote
+        full_dump_counter_remote = self.full_dump_counter_remote
+
+        # Remember start position in the update stream
+        pos = self.update_stream_position
+        #log.debug("Apply update: stream position own={} remote={} full_dump_counter={}", pos, remote_position[0], self.full_dump_counter)
+
+        buf = self.buffer_remote
+        data = self.data
+        loads = None
+
+        # Iterate over all updates until the start of the last update
+        while pos < remote_position[0]:
+            # Read header, it is a marker byte, 4 bytes of length and a FF byte
+            marker, length, end_marker = HEADER.unpack_from(buf, pos)
+            if end_marker != 0xFF:
+                raise AssertionError(f"Bad header in update stream at position {pos}")
+            pos += HEADER_SIZE
+            #log.debug("Found update, update_stream_position={} length={}", self.update_stream_position, length + 6)
+
+            # Copy the record, then check that no new full dump appeared meanwhile.
+            # Writers only overwrite the stream after a new full dump, so the copy is valid.
+            record = bytes(buf[pos:pos+length])
+            if self.full_dump_counter != full_dump_counter_remote[0]:
+                return True
+
+            # Unserialize the update data, we expect a tuple of mode, key and value
+            if marker == MARKER_MARSHAL:
+                mode, key, value = marshal.loads(record)
+            elif marker == MARKER_SERIALIZER:
+                if loads is None:
+                    loads = self.serializer.loads
+                mode, key, value = loads(record)
+            else:
+                raise AssertionError(f"Bad header in update stream at position {pos - HEADER_SIZE}")
+
+            # Update or local dict cache (in our parent)
+            if mode:
+                data[key] = value
+            else:
+                del data[key]
+            pos += length
+            # Remember that we have applied the update
+            self.update_stream_position = pos
+
+        return False
 
     def update(self, other=None, *args, **kwargs):
         # pylint: disable=arguments-differ, keyword-arg-before-vararg
@@ -816,20 +1010,24 @@ class UltraDict(collections.UserDict, dict):
         for k, v in kwargs.items():
             self[k] = v
 
-    def __delitem__(self, key):
-        #log.debug("__delitem__ {}", key)
-        with self.lock:
-            self.apply_update()
+    def check_change_after_error(self, delete, key):
+        """
+        Called when a change cannot be serialized, before the caller raises the serialization error.
+        Raises the error that the change itself would raise first, e.g. KeyError for a missing key.
+        The local copy does not change, so it stays the same as in all other processes.
+        """
+        with self.fast_lock:
+            if delete:
+                self.apply_update()
+                if key not in self.data:
+                    raise KeyError(key)
+            else:
+                # Raises TypeError for an unhashable key
+                hash(key)
 
-            # Update our local copy
-            self.data.__delitem__(key)
-
-            self.append_update(key, b'', delete=True)
-            # TODO: Do something if append_update() fails
-
-    def __setitem__(self, key, item):
-        #log.debug("__setitem__ {}, {}", key, item)
-        with self.lock:
+    def setitem_recurse(self, key, item):
+        """ Slower version of `__setitem__()` that wraps nested dicts in an UltraDict """
+        with self.fast_lock:
             self.apply_update()
 
             if self.recurse:
@@ -857,10 +1055,143 @@ class UltraDict(collections.UserDict, dict):
             self.append_update(key, item)
             # TODO: Do something if append_update() fails
 
-    def __getitem__(self, key):
-        #log.debug("__getitem__ {}", key)
-        self.apply_update()
-        return self.data[key]
+    if ACCELERATED:
+        # The C implementations of FastCore come after UserDict in the MRO,
+        # so they must be set here explicitly
+        __getitem__ = FastCore.__getitem__
+        __setitem__ = FastCore.__setitem__
+        __delitem__ = FastCore.__delitem__
+        __contains__ = FastCore.__contains__
+        __len__ = FastCore.__len__
+        __iter__ = FastCore.__iter__
+        get = FastCore.get
+        keys = FastCore.keys
+        values = FastCore.values
+        replay_stream = FastCore.replay_stream
+
+    else:
+        replay_stream = replay_stream_python
+
+        def changed(self):
+            """
+            True if the stream position or the full dump counter differ from ours.
+            Also True after `close()`, then `apply_update()` raises AlreadyClosed.
+            """
+            try:
+                return self.update_stream_position != self.update_stream_position_remote[0] \
+                    or self.full_dump_counter != self.full_dump_counter_remote[0]
+            except AttributeError:
+                return True
+
+        def __delitem__(self, key):
+            #log.debug("__delitem__ {}", key)
+
+            # Serialize outside of the lock to keep the time holding the lock short
+            try:
+                marker, marshalled = self.serialize_update(False, key, DELETED)
+            except Exception:
+                self.check_change_after_error(True, key)
+                raise
+
+            with self.fast_lock:
+                if self.changed():
+                    self.apply_update()
+
+                # Update our local copy
+                self.data.__delitem__(key)
+
+                self.append_marshalled(marker, marshalled, key, DELETED, True)
+                # TODO: Do something if append_update() fails
+
+        def __setitem__(self, key, item):
+            #log.debug("__setitem__ {}, {}", key, item)
+            if self.recurse:
+                self.setitem_recurse(key, item)
+                return
+
+            # Serialize outside of the lock to keep the time holding the lock short.
+            # The marshal fast path is inlined here, see `serialize_update()`.
+            try:
+                if self.use_marshal and type(key) in MARSHAL_TYPES and type(item) in MARSHAL_TYPES:
+                    marker = MARKER_MARSHAL
+                    marshalled = marshal.dumps((True, key, item), MARSHAL_VERSION)
+                else:
+                    marker = MARKER_SERIALIZER
+                    marshalled = self.serializer.dumps((True, key, item))
+            except Exception:
+                self.check_change_after_error(False, key)
+                raise
+
+            with self.fast_lock:
+                remote_position = self.update_stream_position_remote
+                start_position = remote_position[0]
+
+                # Fast check for remote changes, see `changed()`
+                if self.update_stream_position != start_position \
+                        or self.full_dump_counter != self.full_dump_counter_remote[0]:
+                    self.apply_update()
+                    start_position = remote_position[0]
+
+                # Update our local copy
+                # It's important for the integrity to do this first
+                self.data[key] = item
+
+                # Append the update to the update stream. This is an inlined
+                # version of `append_marshalled()` for the case that the buffer is not full.
+                length = len(marshalled)
+                end_position = start_position + HEADER_SIZE + length
+                if end_position > self.buffer_size:
+                    self.append_marshalled(marker, marshalled, key, item, False)
+                    return
+
+                buf = self.buffer_remote
+                HEADER.pack_into(buf, start_position, marker, length, 0xFF)
+                buf[start_position + HEADER_SIZE:end_position] = marshalled
+
+                # Inform others about it, only after the full record is written
+                self.update_stream_position = end_position
+                remote_position[0] = end_position
+                # TODO: Do something if append_update() fails
+
+        def __getitem__(self, key):
+            #log.debug("__getitem__ {}", key)
+
+            # Fast check for remote changes. Calling apply_update() only when the stream position
+            # or the full dump counter has changed saves a function call on every read.
+            try:
+                if self.update_stream_position != self.update_stream_position_remote[0] \
+                        or self.full_dump_counter != self.full_dump_counter_remote[0]:
+                    self.apply_update()
+            except AttributeError:
+                # Closed, apply_update() raises AlreadyClosed
+                self.apply_update()
+            return self.data[key]
+
+        def get(self, key, default=None):
+            if self.changed():
+                self.apply_update()
+            return self.data.get(key, default)
+
+        def __contains__(self, key):
+            if self.changed():
+                self.apply_update()
+            return key in self.data
+
+        def __len__(self):
+            self.apply_update()
+            return len(self.data)
+
+        def __iter__(self):
+            self.apply_update()
+            return iter(self.data)
+
+        def keys(self):
+            self.apply_update()
+            return self.data.keys()
+
+        def values(self):
+            self.apply_update()
+            return self.data.values()
 
     def __eq__(self, other):
         self.apply_update()
@@ -868,18 +1199,6 @@ class UltraDict(collections.UserDict, dict):
             other.apply_update()
             return self.data == other.data
         return self.data == other
-
-    def __contains__(self, key):
-        self.apply_update()
-        return key in self.data
-
-    def __len__(self):
-        self.apply_update()
-        return len(self.data)
-
-    def __iter__(self):
-        self.apply_update()
-        return iter(self.data)
 
     def __repr__(self):
         try:
@@ -892,15 +1211,15 @@ class UltraDict(collections.UserDict, dict):
 
     def status(self):
         """ Internal debug helper to get the control state variables """
-        ret = { attr: getattr(self, attr) for attr in self.__slots__ if hasattr(self, attr) and attr != 'data' }
+        ret = { attr: getattr(self, attr) for attr in self.STATUS_ATTRS if hasattr(self, attr) and attr != 'data' }
 
-        ret['update_stream_position_remote'] = int.from_bytes(self.update_stream_position_remote, 'little')
+        ret['update_stream_position_remote'] = self.update_stream_position_remote[0]
         ret['lock_pid_remote']               = int.from_bytes(self.lock_pid_remote, 'little')
         ret['lock_remote']                   = int.from_bytes(self.lock_remote, 'little')
         ret['shared_lock_remote']            = self.shared_lock_remote[0:1] == b'1'
         ret['recurse_remote']                = self.recurse_remote[0:1] == b'1'
         ret['lock']                          = self.lock
-        ret['full_dump_counter_remote']      = int.from_bytes(self.full_dump_counter_remote, 'little')
+        ret['full_dump_counter_remote']      = self.full_dump_counter_remote[0]
         ret['full_dump_memory_name_remote']  = bytes(self.full_dump_memory_name_remote).decode('utf-8').strip('\x00').strip()
 
         return ret
@@ -918,12 +1237,19 @@ class UltraDict(collections.UserDict, dict):
         #for item in self.data.items():
         #    print(type(item))
 
+        # Release the direct pointers of the C base class to the shared memory
+        if ACCELERATED:
+            self._unbind()
+
         if hasattr(self, 'lock') and hasattr(self.lock, 'cleanup'):
             self.lock.cleanup()
 
         # If we use RLock(), this closes the file handle
         if hasattr(self, 'lock'):
             del self.lock
+        # Must also go, it can refer to the same semaphore as `self.lock`
+        if hasattr(self, 'fast_lock'):
+            del self.fast_lock
         if hasattr(self, 'full_dump_memory'):
             del self.full_dump_memory
 
@@ -952,14 +1278,6 @@ class UltraDict(collections.UserDict, dict):
 
     def raise_already_closed(self, *args, **kwargs):
         raise Exceptions.AlreadyClosed('UltraDict already closed, you can only access the `UltraDict.data` buffer!')
-
-    def keys(self):
-        self.apply_update()
-        return self.data.keys()
-
-    def values(self):
-        self.apply_update()
-        return self.data.values()
 
     def unlink(self):
         self.close(unlink=True)
@@ -990,7 +1308,10 @@ class UltraDict(collections.UserDict, dict):
             if full_dump_name:
                 self.unlink_by_name(full_dump_name, ignore_errors=True)
 
-            if getattr(self, 'recurse', False):
+            # Only the UltraDict that created the recurse register unlinks the nested
+            # UltraDicts. Nested UltraDicts and UltraDicts that only use the register of
+            # another UltraDict must not unlink the whole tree.
+            if getattr(self, 'recurse', False) and self.owns_recurse_register():
                 self.unlink_recursed()
 
         if hasattr(self, 'control'):
@@ -1000,16 +1321,22 @@ class UltraDict(collections.UserDict, dict):
 
         return data
 
+    def owns_recurse_register(self):
+        """ True if this UltraDict has created its recurse register, see `__init__()` """
+        register = getattr(self, 'recurse_register', None)
+        return type(register) == UltraDict and register.name == f'{self.name}_register'
+
     def unlink_recursed(self):
         #log.debug("Unlink recursed id={}", hex(id(self)))
         if not self.recurse or (type(self.recurse_register) != UltraDict):
             raise Exception("Cannot unlink recursed for non-recurse UltraDict")
 
-        ignore_errors = sys.platform == 'win32'
+        # A nested UltraDict can be gone already, e.g. after a crash or on Windows.
+        # Continue with the others, so the register itself is also unlinked.
         for name in self.recurse_register.keys():
             #log.debug("Unlink recursed child name={}", name)
-            self.unlink_by_name(name=name, ignore_errors=ignore_errors)
-            self.unlink_by_name(name=f"{name}_memory", ignore_errors=ignore_errors)
+            self.unlink_by_name(name=name, ignore_errors=True)
+            self.unlink_by_name(name=f"{name}_memory", ignore_errors=True)
 
         self.recurse_register.close(unlink=True)
 
