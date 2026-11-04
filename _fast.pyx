@@ -740,7 +740,8 @@ cdef class FastCore(dict):
         cdef int marker = 0
         cdef Py_ssize_t key_size, item_size, direct_size = -1
 
-        if self.recurse:
+        # Only a dict needs the recurse mode, it becomes a nested UltraDict
+        if self.recurse and type(item) is dict:
             self.setitem_recurse(key, item)
             return
 
