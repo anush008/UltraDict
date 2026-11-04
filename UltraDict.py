@@ -77,6 +77,16 @@ remove_shm_from_resource_tracker()
 HEADER = struct.Struct('<BIIB')
 HEADER_SIZE = HEADER.size
 
+# Header of a full dump: FF byte, 4 bytes little endian length of the body, 4 bytes little endian
+# CRC32 of the body and one FF byte. The CRC32 is `zlib.crc32(body, full_dump_counter)` with the
+# full dump counter that the full dump belongs to. A reader that sees the new counter before the
+# new full dump, e.g. on a CPU with weak memory order, finds a wrong CRC32 and tries again.
+FULL_DUMP_HEADER = struct.Struct('<BIIB')
+FULL_DUMP_HEADER_SIZE = FULL_DUMP_HEADER.size
+
+class FullDumpMismatch(Exception):
+    """ The full dump does not belong to the full dump counter, see FULL_DUMP_HEADER """
+
 # The first byte of a record header tells how its body is serialized.
 # Full dumps always use MARKER_SERIALIZER.
 MARKER_SERIALIZER = 0xFF  # The serializer of the UltraDict, by default pickle
@@ -763,6 +773,8 @@ class UltraDict(collections.UserDict, FastCore):
 
             marshalled = self.serializer.dumps(self.data)
             length = len(marshalled)
+            # The full dump belongs to the next value of the counter, see FULL_DUMP_HEADER
+            new_full_dump_counter = self.full_dump_counter_remote[0] + 1
 
             # If we don't have a fixed size, let's create full dump memory dynamically
             # TODO: This causes issues on Windows because the memory is not persistant
@@ -771,23 +783,17 @@ class UltraDict(collections.UserDict, FastCore):
                 full_dump_memory = self.full_dump_memory
             else:
                 # Dynamic full dump memory
-                full_dump_memory = self.get_memory(create=True, size=length + 6)
+                full_dump_memory = self.get_memory(create=True, size=length + FULL_DUMP_HEADER_SIZE)
 
             #log.debug("Full dump memory: ", full_dump_memory)
 
-            if length + 6 > full_dump_memory.size:
-                raise Exceptions.FullDumpMemoryFull(f'Full dump memory too small for full dump: needed={length + 6} got={full_dump_memory.size}')
+            if length + FULL_DUMP_HEADER_SIZE > full_dump_memory.size:
+                raise Exceptions.FullDumpMemoryFull(f'Full dump memory too small for full dump: needed={length + FULL_DUMP_HEADER_SIZE} got={full_dump_memory.size}')
 
-            # Write header, 6 bytes
-            # First byte is FF byte
-            full_dump_memory.buf[0:1] = b'\xFF'
-            # Then comes 4 bytes of length of the body
-            full_dump_memory.buf[1:5] = length.to_bytes(4, 'little')
-            # Then another FF bytes, end of header
-            full_dump_memory.buf[5:6] = b'\xFF'
-
-            # Write body
-            full_dump_memory.buf[6:6+length] = marshalled
+            # Write body, then header, see FULL_DUMP_HEADER
+            full_dump_memory.buf[FULL_DUMP_HEADER_SIZE:FULL_DUMP_HEADER_SIZE + length] = marshalled
+            checksum = zlib.crc32(marshalled, new_full_dump_counter & 0xFFFFFFFF)
+            FULL_DUMP_HEADER.pack_into(full_dump_memory.buf, 0, 0xFF, length, checksum, 0xFF)
 
             # On Windows, if we close it, it cannot be read anymore by anyone else.
             if not self.full_dump_size and sys.platform != 'win32':
@@ -862,6 +868,18 @@ class UltraDict(collections.UserDict, FastCore):
         There is a rare case where a full dump is replaced with a newer full dump while
         we didn't have the chance to load the old one. In this case, we just retry.
         """
+        # A full dump that does not match the counter yet can arrive a moment later,
+        # see FULL_DUMP_HEADER
+        for delay in RECORD_RETRY_DELAYS:
+            time.sleep(delay)
+            try:
+                return self.load_once(force=force)
+            except FullDumpMismatch:
+                pass
+        raise AssertionError("The full dump does not match the full dump counter")
+
+    def load_once(self, force=False):
+        """ See `load()` """
         full_dump_counter = self.full_dump_counter_remote[0]
         # Read the name and the full dump only after the counter, see `memory_fence()`
         memory_fence()
@@ -875,21 +893,17 @@ class UltraDict(collections.UserDict, FastCore):
                     full_dump_memory = self.get_full_dump_memory()
 
                 buf = full_dump_memory.buf
-                pos = 0
 
-                # Read header
-                # The first byte should be a FF byte to introduce the header
-                assert bytes(buf[pos:pos+1]) == b'\xFF'
-                pos += 1
-                # Then comes 4 bytes of length
-                length = int.from_bytes(bytes(buf[pos:pos+4]), 'little')
-                assert length > 0, (self.status(), full_dump_memory, bytes(buf[:]).decode('utf-8').strip().strip('\x00'), len(buf))
-                pos += 4
-                #log.debug("Found update, pos={} length={}", pos, length)
-                assert bytes(buf[pos:pos+1]) == b'\xFF'
-                pos += 1
-                # Unserialize the update data, we expect a tuple of key and value
-                self.data = self.serializer.loads(bytes(buf[pos:pos+length]))
+                # Read header, see FULL_DUMP_HEADER
+                start_marker, length, checksum, end_marker = FULL_DUMP_HEADER.unpack_from(buf, 0)
+                body = bytes(buf[FULL_DUMP_HEADER_SIZE:FULL_DUMP_HEADER_SIZE + length])
+                if start_marker != 0xFF or end_marker != 0xFF or length <= 0 \
+                        or zlib.crc32(body, full_dump_counter & 0xFFFFFFFF) != checksum:
+                    if sys.platform != 'win32' and not self.full_dump_memory:
+                        full_dump_memory.close()
+                    raise FullDumpMismatch()
+                # Unserialize the full dump
+                self.data = self.serializer.loads(body)
                 self.full_dump_counter = full_dump_counter
                 self.update_stream_position = 0
 
@@ -902,7 +916,7 @@ class UltraDict(collections.UserDict, FastCore):
             if full_dump_delta > 1:
                 # If more than one new full dump was created during the time we were trying to load one full dump
                 # it can happen that our full dump has just disappeared
-                return self.load(force=True)
+                return self.load_once(force=True)
             # TODO: Before we reach max recursion depth, try to load the full dump using a lock
             self.print_status()
             raise e

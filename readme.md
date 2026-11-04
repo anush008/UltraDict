@@ -280,7 +280,7 @@ dict will automatically load the full dump and continue streaming updates.
 `serializer`: Use a different serialized from the default pickle, e. g. marshal, dill, jsons.
 The module or object provided must support the methods *loads()* and *dumps()*
 
-With the default pickle serializer, UltraDict streams updates with simple keys and values (`int`, `float`, `str`, `bytes`, `bool` and `None`) with `marshal`, because it is several times faster. All other updates and all full dumps use pickle. All processes that share an UltraDict must use the same version of UltraDict. Each update in the stream carries a CRC32 checksum, so a process never reads an update that is not complete.
+With the default pickle serializer, UltraDict streams updates with simple keys and values (`int`, `float`, `str`, `bytes`, `bool` and `None`) with `marshal`, because it is several times faster. All other updates and all full dumps use pickle. All processes that share an UltraDict must use the same version of UltraDict. Each update in the stream and each full dump carries a CRC32 checksum, so a process never reads an update or a full dump that is not complete.
 
 `shared_lock`: When writing to the same dict at the same time from multiple, independent processes,
 they need a shared lock to synchronize and not overwrite each other's changes. Shared locks are slow.

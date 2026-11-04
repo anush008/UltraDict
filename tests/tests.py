@@ -218,6 +218,38 @@ class UltraDictTests(unittest.TestCase):
         finally:
             writer.join()
 
+    def test_full_dump_visible_later(self):
+        # On CPUs with weak memory order, a reader can see the new full dump counter before the
+        # name of the new full dump. Simulate it: publish the counter first and the name later.
+        import threading, pickle, zlib
+        module = sys.modules['UltraDict.UltraDict']
+        ultra = UltraDict({'a': 1})
+        other = UltraDict(name=ultra.name)
+        ultra.dump()
+        self.assertEqual(other['a'], 1)
+
+        new_counter = ultra.full_dump_counter_remote[0] + 1
+        body = pickle.dumps({'a': 2})
+        memory = UltraDict.get_memory(create=True, size=module.FULL_DUMP_HEADER_SIZE + len(body))
+        memory.buf[module.FULL_DUMP_HEADER_SIZE:module.FULL_DUMP_HEADER_SIZE + len(body)] = body
+        module.FULL_DUMP_HEADER.pack_into(memory.buf, 0, 0xFF, len(body), zlib.crc32(body, new_counter), 0xFF)
+        ultra.update_stream_position = 0
+        ultra.update_stream_position_remote[0] = 0
+        ultra.full_dump_counter = new_counter
+        ultra.full_dump_counter_remote[0] = new_counter
+
+        def publish_name():
+            time.sleep(0.02)
+            ultra.full_dump_memory_name_remote[:] = memory.name.encode('utf-8').ljust(255)
+
+        writer = threading.Thread(target=publish_name)
+        writer.start()
+        try:
+            self.assertEqual(other['a'], 2)
+        finally:
+            writer.join()
+            memory.close()
+
     def test_threads(self):
         # The default lock also protects against other threads in the same process
         import threading
