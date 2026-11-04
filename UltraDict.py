@@ -594,7 +594,8 @@ class UltraDict(collections.UserDict, FastCore):
     CORE_ATTRS = 'data', 'update_stream_position', 'full_dump_counter', 'buffer_size', \
         'serializer', 'recurse', 'fast_lock', 'use_marshal'
 
-    __slots__ = python_attrs(STATUS_ATTRS + ('fast_lock', 'use_marshal', 'buffer_remote', 'buffer_pointer_remote'), CORE_ATTRS)
+    __slots__ = python_attrs(STATUS_ATTRS + ('fast_lock', 'use_marshal', 'buffer_remote', 'buffer_pointer_remote',
+        'full_dump_cache'), CORE_ATTRS)
 
     # True if the C extension module `_fast` is used
     accelerated = ACCELERATED
@@ -664,6 +665,8 @@ class UltraDict(collections.UserDict, FastCore):
             self.direct_replay = type(self).apply_update is UltraDict.apply_update
 
         self.full_dump_memory = None
+        # See `cached_full_dump_memory()`
+        self.full_dump_cache = None
 
         # Dynamic full dump memory handling
         # Warning: Issues on Windows when the process ends that has created the full dump memory
@@ -875,32 +878,43 @@ class UltraDict(collections.UserDict, FastCore):
             # If we don't have a fixed size, let's create full dump memory dynamically
             # TODO: This causes issues on Windows because the memory is not persistant
             #       Maybe switch to mmaped file?
+            needed = length + FULL_DUMP_HEADER_SIZE
+            new = False
             if self.full_dump_size and self.full_dump_memory:
                 full_dump_memory = self.full_dump_memory
             else:
-                # Dynamic full dump memory
-                full_dump_memory = self.get_memory(create=True, size=length + FULL_DUMP_HEADER_SIZE)
+                # Dynamic full dump memory. Write the new full dump into the current memory if it
+                # fits, like with a fixed `full_dump_size`. Creating shared memory costs much more
+                # than a small full dump. A reader that reads during the write finds a CRC32 that
+                # does not match and tries again, see `load()`.
+                full_dump_memory = None
+                if old:
+                    try:
+                        full_dump_memory = self.cached_full_dump_memory(old)
+                    except Exceptions.CannotAttachSharedMemory:
+                        pass
+                if full_dump_memory is None or full_dump_memory.size < needed \
+                        or full_dump_memory.size > 8 * max(needed, 4096):
+                    # Leave room to grow, so the next full dumps also fit
+                    full_dump_memory = self.get_memory(create=True, size=max(needed + needed // 2, 4096))
+                    new = True
 
             #log.debug("Full dump memory: ", full_dump_memory)
 
-            if length + FULL_DUMP_HEADER_SIZE > full_dump_memory.size:
-                raise Exceptions.FullDumpMemoryFull(f'Full dump memory too small for full dump: needed={length + FULL_DUMP_HEADER_SIZE} got={full_dump_memory.size}')
+            if needed > full_dump_memory.size:
+                raise Exceptions.FullDumpMemoryFull(f'Full dump memory too small for full dump: needed={needed} got={full_dump_memory.size}')
 
             # Write body, then header, see FULL_DUMP_HEADER
             full_dump_memory.buf[FULL_DUMP_HEADER_SIZE:FULL_DUMP_HEADER_SIZE + length] = marshalled
             checksum = zlib.crc32(marshalled, new_full_dump_counter & 0xFFFFFFFF)
             FULL_DUMP_HEADER.pack_into(full_dump_memory.buf, 0, 0xFF, length, checksum, 0xFF)
 
-            # On Windows, if we close it, it cannot be read anymore by anyone else.
-            if not self.full_dump_size and sys.platform != 'win32':
-                full_dump_memory.close()
-
             # TODO: There's a slight chance of something going wrong when we first update
             #       the remote memory name and then the counter.
 
             # Only after we have filled the new full dump memory with the marshalled data,
             # we update the remote name so other users can find it
-            if not (self.full_dump_size and self.full_dump_memory):
+            if new:
                 self.full_dump_memory_name_remote[:] = full_dump_memory.name.encode('utf-8').ljust(255)
 
             # The full dump and its name must be visible to other processes before the
@@ -922,15 +936,42 @@ class UltraDict(collections.UserDict, FastCore):
 
             #log.info("Dumped dict with {} elements to {} bytes, remote_counter={}", len(self), len(marshalled), current+1)
 
-            # If the old full dump memory was dynamically created, delete it
-            if old and old != full_dump_memory.name and not self.full_dump_size:
-                self.unlink_by_name(old)
+            if new:
+                # Delete the old dynamic full dump memory
+                cache = self.full_dump_cache
+                if old and cache is not None and cache.name == old:
+                    cache.unlink()
+                elif old:
+                    self.unlink_by_name(old)
+                self.set_full_dump_cache(full_dump_memory)
 
             # On Windows, we need to keep a reference to the full dump memory,
             # otherwise it's destoryed
             self.full_dump_memory = full_dump_memory
 
             return full_dump_memory
+
+    def cached_full_dump_memory(self, name):
+        """
+        Return the dynamic full dump memory with `name`, see `full_dump_cache`.
+
+        Each UltraDict keeps the dynamic full dump memory that it used last open, because
+        opening shared memory costs much more than reading a small full dump. Names of dynamic
+        full dump memory are never used again, so the same name means the same memory.
+        """
+        cache = self.full_dump_cache
+        if cache is not None and cache.name == name:
+            return cache
+        memory = self.get_memory(create=False, name=name)
+        self.set_full_dump_cache(memory)
+        return memory
+
+    def set_full_dump_cache(self, memory):
+        """ Keep `memory` open as the dynamic full dump memory, and close the one before """
+        cache = self.full_dump_cache
+        self.full_dump_cache = memory
+        if cache is not None and cache is not memory:
+            cache.close()
 
     def get_full_dump_memory(self, max_retry=3, retry=0):
         """
@@ -945,7 +986,7 @@ class UltraDict(collections.UserDict, FastCore):
             name = bytes(self.full_dump_memory_name_remote).decode('utf-8').strip().strip('\x00')
             #log.debug("Full dump name={}", name)
             assert len(name) >= 1
-            return self.get_memory(create=False, name=name)
+            return self.cached_full_dump_memory(name)
         except Exceptions.CannotAttachSharedMemory as e:
             if retry < max_retry:
                 return self.get_full_dump_memory(max_retry=max_retry, retry=retry+1)
@@ -967,7 +1008,9 @@ class UltraDict(collections.UserDict, FastCore):
         # A full dump that does not match the counter yet can arrive a moment later,
         # see FULL_DUMP_HEADER
         for delay in RECORD_RETRY_DELAYS:
-            time.sleep(delay)
+            # `time.sleep(0)` still costs a system call of about 65 microseconds on Linux
+            if delay:
+                time.sleep(delay)
             try:
                 return self.load_once(force=force)
             except FullDumpMismatch:
@@ -982,31 +1025,24 @@ class UltraDict(collections.UserDict, FastCore):
         #log.debug("Loading full dump local_counter={} remote_counter={}", self.full_dump_counter, full_dump_counter)
         try:
             if force or (self.full_dump_counter < full_dump_counter):
-                dynamic = not (self.full_dump_size and self.full_dump_memory)
-                if dynamic:
-                    # Retry if necessary
+                if not (self.full_dump_size and self.full_dump_memory):
+                    # Dynamic full dump memory, retry if necessary
                     full_dump_memory = self.get_full_dump_memory()
                 else:
                     full_dump_memory = self.full_dump_memory
 
-                try:
-                    buf = full_dump_memory.buf
+                buf = full_dump_memory.buf
 
-                    # Read header, see FULL_DUMP_HEADER
-                    start_marker, length, checksum, end_marker = FULL_DUMP_HEADER.unpack_from(buf, 0)
-                    body = bytes(buf[FULL_DUMP_HEADER_SIZE:FULL_DUMP_HEADER_SIZE + length])
-                    if start_marker != 0xFF or end_marker != 0xFF or length <= 0 \
-                            or zlib.crc32(body, full_dump_counter & 0xFFFFFFFF) != checksum:
-                        raise FullDumpMismatch()
-                    # Unserialize the full dump
-                    self.data = self.serializer.loads(body)
-                    self.full_dump_counter = full_dump_counter
-                    self.update_stream_position = 0
-                finally:
-                    # Close the dynamic full dump memory after reading it. Without this, PyPy keeps
-                    # the file descriptor open until its garbage collector runs.
-                    if dynamic and sys.platform != 'win32':
-                        full_dump_memory.close()
+                # Read header, see FULL_DUMP_HEADER
+                start_marker, length, checksum, end_marker = FULL_DUMP_HEADER.unpack_from(buf, 0)
+                body = bytes(buf[FULL_DUMP_HEADER_SIZE:FULL_DUMP_HEADER_SIZE + length])
+                if start_marker != 0xFF or end_marker != 0xFF or length <= 0 \
+                        or zlib.crc32(body, full_dump_counter & 0xFFFFFFFF) != checksum:
+                    raise FullDumpMismatch()
+                # Unserialize the full dump
+                self.data = self.serializer.loads(body)
+                self.full_dump_counter = full_dump_counter
+                self.update_stream_position = 0
             else:
                 raise Exception("Cannot load full dump, no new data available")
         except AssertionError as e:
@@ -1107,7 +1143,8 @@ class UltraDict(collections.UserDict, FastCore):
                 # a moment for the record to arrive. The pauses happen without the lock, so other
                 # processes can write meanwhile. A record that is still bad at the end is damaged.
                 for delay in RECORD_RETRY_DELAYS:
-                    time.sleep(delay)
+                    if delay:
+                        time.sleep(delay)
                     with self.fast_lock:
                         if self.full_dump_counter < self.full_dump_counter_remote[0]:
                             log.warning(f"Full dumps too fast full_dump_counter={self.full_dump_counter} full_dump_counter_remote={self.full_dump_counter_remote[0]}. Consider increasing buffer_size.")
@@ -1291,7 +1328,8 @@ class UltraDict(collections.UserDict, FastCore):
 
         def __setitem__(self, key, item):
             #log.debug("__setitem__ {}, {}", key, item)
-            if self.recurse:
+            # Only a dict needs the recurse mode, it becomes a nested UltraDict
+            if self.recurse and type(item) is dict:
                 self.setitem_recurse(key, item)
                 return
 
@@ -1414,6 +1452,9 @@ class UltraDict(collections.UserDict, FastCore):
             del self.fast_lock
         if hasattr(self, 'full_dump_memory'):
             del self.full_dump_memory
+        if getattr(self, 'full_dump_cache', None) is not None:
+            self.full_dump_cache.close()
+            self.full_dump_cache = None
 
         data = self.data
         del self.data

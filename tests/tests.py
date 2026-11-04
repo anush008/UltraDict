@@ -215,31 +215,59 @@ class UltraDictTests(unittest.TestCase):
                         if isinstance(e, float) and not math.isnan(e):
                             self.assertEqual(math.copysign(1, g), math.copysign(1, e), change)
 
-    @unittest.skipIf(sys.platform == 'win32', "Windows keeps the dynamic full dump memory open")
-    def test_loaded_full_dump_is_closed(self):
-        # A process that has made a full dump itself must still close the full dumps that it loads
-        # from other processes. PyPy closes an unreferenced SharedMemory only when its garbage
-        # collector runs, so each load kept a file descriptor open.
+    def test_full_dump_memory_is_reused_and_closed(self):
+        # A full dump that fits goes into the same dynamic full dump memory
         writer = UltraDict(buffer_size=10_000)
         loader = UltraDict(name=writer.name)
+        # A process that has made a full dump itself also loads the full dumps of others
         loader['own'] = 1
         loader.dump()
-        opened = []
-        original = loader.get_full_dump_memory
-        def get_full_dump_memory(*args, **kwargs):
-            memory = original(*args, **kwargs)
-            opened.append(memory)
-            return memory
-        with mock.patch.object(loader, 'get_full_dump_memory', get_full_dump_memory):
-            for i in range(3):
-                writer['i'] = i
-                writer.dump()
-                self.assertEqual(loader['i'], i)
-        self.assertEqual(len(opened), 3)
-        for memory in opened:
-            with self.assertRaises((TypeError, ValueError, AttributeError)):
-                memory.buf[0]
+        names = set()
+        for i in range(3):
+            writer['i'] = i
+            writer.dump()
+            self.assertEqual(loader['i'], i)
+            names.add(writer.status()['full_dump_memory_name_remote'])
+        self.assertEqual(len(names), 1)
+
+        # A bigger full dump needs new memory. Each UltraDict keeps only the memory it used last
+        # open. PyPy closes an unreferenced SharedMemory only when its garbage collector runs,
+        # so before, each load kept a file descriptor open.
+        used = []
+        for size in (20_000, 200_000, 2_000_000):
+            writer['big'] = 'x' * size
+            self.assertEqual(len(loader['big']), size)
+            used.append(loader.full_dump_cache)
+        self.assertEqual(len({id(memory) for memory in used}), 3)
+        for memory in used[:-1]:
+            self.assertIsNone(memory.buf)
+        self.assertIsNotNone(used[-1].buf)
+        loader.close()
+        self.assertIsNone(used[-1].buf)
         writer.unlink()
+
+    def test_recurse_values_that_are_not_dicts(self):
+        # With recurse=True, only a dict becomes a nested UltraDict. Other values use the normal
+        # write, also in nested UltraDicts.
+        ultra = UltraDict(recurse=True, buffer_size=100_000)
+        other = UltraDict(name=ultra.name)
+        ultra['nested'] = {'inner': {}}
+        inner = ultra['nested']['inner']
+        self.assertIs(type(inner), UltraDict)
+        for i in range(50):
+            inner[i] = i
+            inner[('t', i)] = [i, {'plain': i}]
+        del inner[0]
+        with self.assertRaises(Exception):
+            inner['bad'] = lambda: 1
+        self.assertNotIn('bad', inner)
+        seen = other['nested']['inner']
+        self.assertEqual({k: seen[k] for k in range(1, 50)}, {k: k for k in range(1, 50)})
+        self.assertEqual(seen[('t', 7)], [7, {'plain': 7}])
+        self.assertIs(type(seen[('t', 7)][1]), dict)
+        self.assertNotIn(0, seen)
+        self.assertNotIn('bad', seen)
+        ultra.unlink()
 
     def test_record_visible_later(self):
         # On CPUs with weak memory order, a reader can see the new stream position before the

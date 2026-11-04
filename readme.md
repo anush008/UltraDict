@@ -24,8 +24,8 @@ Features:
 
 It does so by using a *stream of updates* in a shared memory buffer. This is efficient because only changes have to be serialized and transferred.
 
-If the buffer is full, `UltraDict` will automatically do a full dump to a new shared
-memory space, reset the streaming buffer and continue to stream further updates. All users
+If the buffer is full, `UltraDict` will automatically do a full dump to shared
+memory, reset the streaming buffer and continue to stream further updates. All users
 of the `UltraDict` will automatically load full dumps and continue using
 streaming updates afterwards.
 
@@ -142,23 +142,23 @@ Time per operation on Python 3.13, Linux x86_64, with simple keys and values and
 
 | Operation | Before the C extension | Pure Python | C extension |
 |---|---|---|---|
-| Read `u[1]` | 204 ns | 78 ns | 24 ns |
-| Read `u.get(1)` | 474 ns | 99 ns | 35 ns |
-| `1 in u` | 220 ns | 102 ns | 24 ns |
-| Write `u[1] = 1` | 1,866 ns | 852 ns | 264 ns |
-| Write, then read in a second instance | 3,952 ns | 2,105 ns | 623 ns |
-| Write with `shared_lock=True` | 14,031 ns | 2,126 ns | 161 ns |
+| Read `u[1]` | 228 ns | 99 ns | 28 ns |
+| Read `u.get(1)` | 521 ns | 106 ns | 38 ns |
+| `1 in u` | 222 ns | 108 ns | 27 ns |
+| Write `u[1] = 1` | 1,986 ns | 743 ns | 105 ns |
+| Write, then read in a second instance | 3,793 ns | 1,626 ns | 259 ns |
+| Write with `shared_lock=True` | 14,166 ns | 2,165 ns | 91 ns |
 
 Time per operation on PyPy 3.11, Linux x86_64, with the same keys, values and `buffer_size`:
 
 | Operation | Before cffi | cffi |
 |---|---|---|
-| Read `u[1]` | 34 ns | 4.4 ns |
-| Read `u.get(1)` | 34 ns | 4.4 ns |
-| `1 in u` | 36 ns | 4.4 ns |
-| Write `u[1] = 1` | 1,202 ns | 233 ns |
-| Write, then read in a second instance | 1,727 ns | 794 ns |
-| Write with `shared_lock=True` | Fails, see the bug fixes below | 266 ns |
+| Read `u[1]` | 33 ns | 4.0 ns |
+| Read `u.get(1)` | 34 ns | 4.2 ns |
+| `1 in u` | 36 ns | 4.3 ns |
+| Write `u[1] = 1` | 1,060 ns | 140 ns |
+| Write, then read in a second instance | 1,629 ns | 452 ns |
+| Write with `shared_lock=True` | Fails, see the bug fixes below | 180 ns |
 
 With the default `buffer_size` of 10,000 bytes, a full dump happens every few hundred small writes. A bigger `buffer_size`, e.g. `1_000_000`, makes full dumps rarer and writes faster.
 
@@ -284,8 +284,9 @@ The buffer size limits the biggest change that can be streamed, so when you use 
 deeply nested dicts you might need a bigger buffer. Otherwise, if the buffer is too small,
 it will fall back to a full dump. Creating full dumps can be slow, depending on the size of your dict.
 
-Whenever the buffer is full, a full dump will be created. A new shared memory is allocated just
-big enough for the full dump. Afterwards the streaming buffer is reset.  All other users of the
+Whenever the buffer is full, a full dump will be created. UltraDict writes the full dump into the
+shared memory of the last full dump if it fits. Otherwise, it allocates new shared memory with room
+for the full dump to grow by half. Afterwards the streaming buffer is reset.  All other users of the
 dict will automatically load the full dump and continue streaming updates.
 
 (Also see the section [Memory management](#memory-management) below!)
@@ -486,5 +487,5 @@ These bug fixes change the behavior of the original implementation:
 * Deleting a key works with every serializer. Delete records now use `None` as their value. Before, they used `b''`, which a JSON serializer cannot write.
 * A reader ignores a delete in the stream for a key that its local copy does not have. Before, it raised `KeyError`, e.g. after another process changed its local copy with `|=`, which does not stream the change, or when two threads read through the same UltraDict.
 * `shared_lock=True` works on PyPy. Before, the `exchange()` of the `atomics` package returned a wrong value there, so a lock could not be released.
-* A process closes each full dump that it loads from another process, also after it made a full dump itself. Before, such a process kept the full dump memory open until the garbage collector freed it. On PyPy, many full dumps used up all file descriptors.
+* Each UltraDict keeps at most one dynamic full dump memory open. Before, a process that had made a full dump itself kept each full dump that it loaded from another process open until the garbage collector freed it. On PyPy, many full dumps used up all file descriptors.
 * Only the UltraDict that created the recurse register unlinks the nested UltraDicts when it closes. Before, an UltraDict that only used the register of another UltraDict (`recurse_register`), or a nested UltraDict on `unlink()`, unlinked the whole tree. The owner then failed to close with `CannotAttachSharedMemory`.
