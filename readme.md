@@ -20,24 +20,19 @@ Features:
 
 ## Installation
 
-Install a wheel from a GitHub release. The CPython wheels contain the C extension, so the machine needs no C compiler. Copy the link of the wheel for your platform and Python version from the [release page](https://github.com/anush008/UltraDict/releases):
+Install UltraDict from the source on GitHub. The install needs a C compiler. On CPython, it builds the C extension. On PyPy, which uses cffi instead of the C extension, it builds the `psutil` package, which has no wheels for PyPy. Without a C compiler, the install fails.
 
-```bash
-pip install "https://github.com/anush008/UltraDict/releases/download/v0.1.0/<wheel file name>"
-```
-
-PyPy and other platforms use the wheel that ends with `py3-none-any.whl`.
-
-You can also install from the source on GitHub. Then pip builds the C extension, which needs Cython and a C compiler. Without a C compiler, UltraDict uses its pure Python implementation and pip shows a warning.
-
-```bash
-pip install "UltraDict @ git+https://github.com/anush008/UltraDict@v0.1.0"
-```
-
-With uv, add the tag as a git source. uv pins the commit of the tag in `uv.lock`:
+With uv, pin a tag or a commit hash with one of these commands. uv pins the commit in `uv.lock`:
 
 ```bash
 uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --tag v0.1.0
+uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --rev 5d39e6988c1372dc16eebde9263ddb18f3812aa0
+```
+
+With pip:
+
+```bash
+pip install "UltraDict @ git+https://github.com/anush008/UltraDict@v0.1.0"
 ```
 
 For a Docker image without a C compiler, run `uv sync` in a build stage that has a C compiler, then copy the virtual environment into the final image.
@@ -142,7 +137,7 @@ Back in the first Python REPL:
 
 UltraDict includes an optional C extension, `_fast`. It moves the hot paths out of the Python interpreter: reads, writes, the replay of the update stream and the shared lock. UltraDict uses it automatically when it is available. Without it, UltraDict uses its pure Python implementation with the same behavior.
 
-The wheels for CPython 3.11 to 3.14 on Linux, macOS and Windows contain the C extension, so they need no compiler. The workflow `.github/workflows/wheels.yml` builds and checks them. Other platforms build the C extension from the source distribution with Cython and a C compiler.
+On CPython, the install builds the C extension with Cython and a C compiler. Without a C compiler, the install fails.
 
 Check which implementation is active:
 
@@ -506,7 +501,7 @@ python -m unittest
 ULTRADICT_PURE_PYTHON=1 python -m unittest
 ```
 
-To make a release, set `version` in `setup.py`, then push a tag with the same version, e.g. `v0.1.0`. The workflow `.github/workflows/wheels.yml` then attaches the wheels and the source distribution to a new GitHub release.
+To make a release, set `version` in `setup.py`, then push a tag with the same version, e.g. `v0.1.0`.
 
 `tests/api_check.py` calls every part of the public API and prints one line for each step. `tests/api_check_expected.txt` holds the output of the original implementation with the bug fixes below. The test `test_api_behavior_unchanged` fails if any step behaves differently.
 
