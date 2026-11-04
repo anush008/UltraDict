@@ -140,14 +140,14 @@ Time per operation on Python 3.13, Linux x86_64, with simple keys and values and
 
 | Operation | Before the C extension | Pure Python | C extension |
 |---|---|---|---|
-| Read `u[1]` | 204 ns | 90 ns | 21 ns |
-| Read `u.get(1)` | 474 ns | 113 ns | 32 ns |
-| `1 in u` | 220 ns | 114 ns | 21 ns |
-| Write `u[1] = 1` | 1,866 ns | 797 ns | 219 ns |
-| Write, then read in a second instance | 3,952 ns | 1,678 ns | 484 ns |
-| Write with `shared_lock=True` | 14,031 ns | 1,927 ns | 130 ns |
+| Read `u[1]` | 204 ns | 78 ns | 24 ns |
+| Read `u.get(1)` | 474 ns | 99 ns | 35 ns |
+| `1 in u` | 220 ns | 102 ns | 24 ns |
+| Write `u[1] = 1` | 1,866 ns | 852 ns | 264 ns |
+| Write, then read in a second instance | 3,952 ns | 2,105 ns | 623 ns |
+| Write with `shared_lock=True` | 14,031 ns | 2,126 ns | 161 ns |
 
-With the default `buffer_size` of 10,000 bytes, a full dump happens every few hundred small writes. With `buffer_size=1_000_000`, a write takes about 95 ns and a write with `shared_lock=True` about 65 ns.
+With the default `buffer_size` of 10,000 bytes, a full dump happens every few hundred small writes. A bigger `buffer_size`, e.g. `1_000_000`, makes full dumps rarer and writes faster.
 
 ## Performance comparison
 
@@ -280,7 +280,7 @@ dict will automatically load the full dump and continue streaming updates.
 `serializer`: Use a different serialized from the default pickle, e. g. marshal, dill, jsons.
 The module or object provided must support the methods *loads()* and *dumps()*
 
-With the default pickle serializer, UltraDict streams updates with simple keys and values (`int`, `float`, `str`, `bytes`, `bool` and `None`) with `marshal`, because it is several times faster. All other updates and all full dumps use pickle. All processes that share an UltraDict must use the same version of UltraDict.
+With the default pickle serializer, UltraDict streams updates with simple keys and values (`int`, `float`, `str`, `bytes`, `bool` and `None`) with `marshal`, because it is several times faster. All other updates and all full dumps use pickle. All processes that share an UltraDict must use the same version of UltraDict. Each update in the stream carries a CRC32 checksum, so a process never reads an update that is not complete.
 
 `shared_lock`: When writing to the same dict at the same time from multiple, independent processes,
 they need a shared lock to synchronize and not overwrite each other's changes. Shared locks are slow.

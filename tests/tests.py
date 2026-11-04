@@ -190,23 +190,26 @@ class UltraDictTests(unittest.TestCase):
     def test_record_visible_later(self):
         # On CPUs with weak memory order, a reader can see the new stream position before the
         # record. Simulate it: publish the position first and write the record a moment later.
-        import threading, pickle
+        import threading, pickle, zlib
         ultra = UltraDict(buffer_size=10_000)
         other = UltraDict(name=ultra.name)
         ultra['before'] = 1
         self.assertEqual(other['before'], 1)
 
+        module = sys.modules['UltraDict.UltraDict']
         body = pickle.dumps((True, 'late', 2))
         start = ultra.update_stream_position_remote[0]
-        end = start + 6 + len(body)
+        end = start + module.HEADER_SIZE + len(body)
         ultra.buffer.buf[start:end] = bytes(end - start)
         ultra.update_stream_position = end
         ultra.update_stream_position_remote[0] = end
 
         def write_record():
             time.sleep(0.02)
-            ultra.buffer.buf[start + 6:end] = body
-            ultra.buffer.buf[start:start + 6] = b'\xff' + len(body).to_bytes(4, 'little') + b'\xff'
+            # The body first, then the header, like a writer that reorders its stores
+            ultra.buffer.buf[start + module.HEADER_SIZE:end] = body
+            checksum = zlib.crc32(body, ultra.full_dump_counter)
+            module.HEADER.pack_into(ultra.buffer.buf, start, 0xFF, len(body), checksum, 0xFF)
 
         writer = threading.Thread(target=write_record)
         writer.start()

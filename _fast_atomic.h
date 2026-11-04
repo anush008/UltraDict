@@ -82,4 +82,29 @@ static inline int ud_cmpxchg_u32(uint32_t *p, uint32_t expected, uint32_t desire
 
 #endif
 
+/*
+ * CRC32 of stream records, the same as zlib.crc32(data, seed) in Python.
+ * Call ud_crc32_init() once before the first ud_crc32().
+ */
+static uint32_t ud_crc32_table[256];
+
+static void ud_crc32_init(void) {
+    uint32_t i, k, c;
+    for (i = 0; i < 256; i++) {
+        c = i;
+        for (k = 0; k < 8; k++) {
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        }
+        ud_crc32_table[i] = c;
+    }
+}
+
+static uint32_t ud_crc32(uint32_t seed, const unsigned char *p, size_t n) {
+    uint32_t crc = ~seed;
+    while (n--) {
+        crc = ud_crc32_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
 #endif /* ULTRADICT_FAST_ATOMIC_H */

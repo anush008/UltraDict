@@ -56,9 +56,13 @@ cdef extern from "_fast_atomic.h":
     void ud_fence_acquire() nogil
     void ud_fence_full() nogil
     int ud_cmpxchg_u32(uint32_t *p, uint32_t expected, uint32_t desired) nogil
+    void ud_crc32_init() nogil
+    uint32_t ud_crc32(uint32_t seed, const unsigned char *p, size_t n) nogil
 
 # UltraDict.py only uses this module if the version matches
-VERSION = 2
+VERSION = 3
+
+ud_crc32_init()
 
 def fence():
     """
@@ -67,8 +71,10 @@ def fence():
     """
     ud_fence_full()
 
+# Header of a stream record: marker byte, 4 bytes length, 4 bytes CRC32 of the body, FF byte.
+# The CRC32 is seeded with the full dump counter, see UltraDict.py.
 cdef enum:
-    HEADER_SIZE = 6
+    HEADER_SIZE = 10
     MARKER_SERIALIZER = 0xFF
     MARKER_MARSHAL = 0xFE
     MARSHAL_VERSION = 4
@@ -560,10 +566,11 @@ cdef class FastCore(dict):
 
             # Write header and body
             p = self.stream_ptr + start
+            memcpy(p + HEADER_SIZE, payload_buffer.buf, length)
             p[0] = <unsigned char>marker
             write_u32_le(p + 1, <uint32_t>length)
-            p[5] = 0xFF
-            memcpy(p + HEADER_SIZE, payload_buffer.buf, length)
+            write_u32_le(p + 5, ud_crc32(<uint32_t>self.full_dump_counter, <const unsigned char *>payload_buffer.buf, length))
+            p[9] = 0xFF
         finally:
             PyBuffer_Release(&payload_buffer)
 
@@ -589,7 +596,7 @@ cdef class FastCore(dict):
         cdef Py_ssize_t start, length
         cdef unsigned char *p
         cdef unsigned char marker
-        cdef uint32_t counter
+        cdef uint32_t counter, checksum, actual
         cdef char local_record[STACK_RECORD_SIZE]
 
         data = self.get_data()
@@ -599,13 +606,14 @@ cdef class FastCore(dict):
             if pos >= <Py_ssize_t>ud_load_acquire_u32(self.position_ptr):
                 break
 
-            # Read header, it is a marker byte, 4 bytes of length and a FF byte
+            # Read header, see HEADER_SIZE
             if pos + HEADER_SIZE > self.stream_length:
                 raise AssertionError(f"Bad header in update stream at position {pos}")
             p = self.stream_ptr + pos
             marker = p[0]
             length = read_u32_le(p + 1)
-            if p[5] != 0xFF:
+            checksum = read_u32_le(p + 5)
+            if p[9] != 0xFF:
                 raise AssertionError(f"Bad header in update stream at position {pos}")
             start = pos + HEADER_SIZE
             if start + length > self.stream_length:
@@ -622,6 +630,15 @@ cdef class FastCore(dict):
             memcpy(&counter, self.counter_ptr, 4)
             if <Py_ssize_t>counter != self.full_dump_counter:
                 return 1
+
+            # Never parse a record that is not complete. A writer without the C extension on a
+            # CPU with weak memory order can make the stream position visible before the record.
+            if record is None:
+                actual = ud_crc32(<uint32_t>self.full_dump_counter, <const unsigned char *>local_record, length)
+            else:
+                actual = ud_crc32(<uint32_t>self.full_dump_counter, <const unsigned char *>PyBytes_AS_STRING(record), length)
+            if actual != checksum:
+                raise AssertionError(f"Bad checksum in update stream at position {pos}")
 
             # Unserialize the update data, we expect a tuple of mode, key and value
             if marker == MARKER_MARSHAL:
@@ -654,21 +671,22 @@ cdef class FastCore(dict):
         """
         cdef Py_ssize_t start, end
         cdef unsigned char *p
+        cdef unsigned char *body
 
         if self.position_ptr != NULL:
             start = self.position_ptr[0]
             end = start + HEADER_SIZE + length
             if end <= self.buffer_size and end <= self.stream_length:
                 p = self.stream_ptr + start
+                body = p + HEADER_SIZE
+                body[0] = M_SMALL_TUPLE
+                body[1] = 3
+                body[2] = M_TRUE if mode else M_FALSE
+                marshal_write(item, marshal_write(key, body + 3))
                 p[0] = MARKER_MARSHAL
                 write_u32_le(p + 1, <uint32_t>length)
-                p[5] = 0xFF
-                p += HEADER_SIZE
-                p[0] = M_SMALL_TUPLE
-                p[1] = 3
-                p[2] = M_TRUE if mode else M_FALSE
-                p = marshal_write(key, p + 3)
-                marshal_write(item, p)
+                write_u32_le(p + 5, ud_crc32(<uint32_t>self.full_dump_counter, body, length))
+                p[9] = 0xFF
 
                 # Inform others about it, only after the full record is written
                 self.update_stream_position = end

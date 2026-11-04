@@ -21,7 +21,7 @@
 __all__ = ['UltraDict']
 
 import multiprocessing, multiprocessing.shared_memory, multiprocessing.synchronize
-import collections, marshal, os, pickle, platform, struct, sys, time, weakref
+import collections, marshal, os, pickle, platform, struct, sys, time, weakref, zlib
 import importlib.util, importlib.machinery
 
 try:
@@ -70,9 +70,11 @@ def remove_shm_from_resource_tracker():
 #More details at: https://bugs.python.org/issue38119
 remove_shm_from_resource_tracker()
 
-# Header of each record in the update stream and in the full dump memory:
-# one marker byte, 4 bytes little endian length of the body, one FF byte
-HEADER = struct.Struct('<BIB')
+# Header of each record in the update stream: one marker byte, 4 bytes little endian length
+# of the body, 4 bytes little endian CRC32 of the body and one FF byte.
+# The CRC32 is `zlib.crc32(body, full_dump_counter)`. Readers check it before they parse a record,
+# so they never parse a record that is not complete yet, or one from before the last full dump.
+HEADER = struct.Struct('<BIIB')
 HEADER_SIZE = HEADER.size
 
 # The first byte of a record header tells how its body is serialized.
@@ -96,7 +98,7 @@ ACCELERATED = False
 if not os.environ.get('ULTRADICT_PURE_PYTHON'):
     try:
         from . import _fast
-        if getattr(_fast, 'VERSION', None) == 2:
+        if getattr(_fast, 'VERSION', None) == 3:
             ACCELERATED = True
     except ImportError:
         pass
@@ -952,8 +954,9 @@ class UltraDict(collections.UserDict, FastCore):
         # Write header and body directly into the shared memory, without
         # concatenating them in a temporary bytes object first
         buf = self.buffer_remote
-        HEADER.pack_into(buf, start_position, marker, length, 0xFF)
+        checksum = zlib.crc32(marshalled, self.full_dump_counter & 0xFFFFFFFF)
         buf[start_position + HEADER_SIZE:end_position] = marshalled
+        HEADER.pack_into(buf, start_position, marker, length, checksum, 0xFF)
 
         # Inform others about it, only after the full record is written
         self.update_stream_position = end_position
@@ -1051,7 +1054,7 @@ class UltraDict(collections.UserDict, FastCore):
         # Iterate over all updates until the start of the last update
         while pos < remote_position[0]:
             # Read header, it is a marker byte, 4 bytes of length and a FF byte
-            marker, length, end_marker = HEADER.unpack_from(buf, pos)
+            marker, length, checksum, end_marker = HEADER.unpack_from(buf, pos)
             if end_marker != 0xFF:
                 raise AssertionError(f"Bad header in update stream at position {pos}")
             pos += HEADER_SIZE
@@ -1062,6 +1065,10 @@ class UltraDict(collections.UserDict, FastCore):
             record = bytes(buf[pos:pos+length])
             if self.full_dump_counter != full_dump_counter_remote[0]:
                 return True
+
+            # Never parse a record that is not complete, see HEADER
+            if zlib.crc32(record, self.full_dump_counter & 0xFFFFFFFF) != checksum:
+                raise AssertionError(f"Bad checksum in update stream at position {pos - HEADER_SIZE}")
 
             # Unserialize the update data, we expect a tuple of mode, key and value
             if marker == MARKER_MARSHAL:
@@ -1231,8 +1238,9 @@ class UltraDict(collections.UserDict, FastCore):
                     return
 
                 buf = self.buffer_remote
-                HEADER.pack_into(buf, start_position, marker, length, 0xFF)
+                checksum = zlib.crc32(marshalled, self.full_dump_counter & 0xFFFFFFFF)
                 buf[start_position + HEADER_SIZE:end_position] = marshalled
+                HEADER.pack_into(buf, start_position, marker, length, checksum, 0xFF)
 
                 # Inform others about it, only after the full record is written
                 self.update_stream_position = end_position

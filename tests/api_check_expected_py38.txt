@@ -135,7 +135,7 @@ append_update: int:5
 append_update local data unchanged: bool:False
 append_update delete: bool:False
 status keys: [str:'auto_unlink', str:'buffer', str:'buffer_size', str:'closed', str:'control', str:'finalizer', str:'full_dump_counter', str:'full_dump_counter_remote', str:'full_dump_memory', str:'full_dump_memory_name_remote', str:'full_dump_size', str:'full_dump_static_size_remote', str:'lock', str:'lock_pid_remote', str:'lock_remote', str:'name', str:'recurse', str:'recurse_register', str:'recurse_remote', str:'serializer', str:'shared_lock', str:'shared_lock_remote', str:'update_stream_position', str:'update_stream_position_remote']
-status values: {str:'update_stream_position': int:69, str:'update_stream_position_remote': int:69, str:'full_dump_counter': int:1, str:'full_dump_counter_remote': int:1, str:'lock_pid_remote': int:0, str:'lock_remote': int:0, str:'shared_lock_remote': bool:False, str:'recurse_remote': bool:False, str:'buffer_size': int:10000, str:'recurse': NoneType:None, str:'closed': bool:False, str:'auto_unlink': bool:True, str:'full_dump_size': NoneType:None, str:'shared_lock': NoneType:None}
+status values: {str:'update_stream_position': int:77, str:'update_stream_position_remote': int:77, str:'full_dump_counter': int:1, str:'full_dump_counter_remote': int:1, str:'lock_pid_remote': int:0, str:'lock_remote': int:0, str:'shared_lock_remote': bool:False, str:'recurse_remote': bool:False, str:'buffer_size': int:10000, str:'recurse': NoneType:None, str:'closed': bool:False, str:'auto_unlink': bool:True, str:'full_dump_size': NoneType:None, str:'shared_lock': NoneType:None}
 print_status: bool:True
 print_status stderr: bool:True
 get_memory attach: SharedMemory
