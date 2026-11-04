@@ -25,14 +25,14 @@ Install UltraDict from the source on GitHub. The install needs a C compiler. On 
 With uv, pin a tag or a commit hash with one of these commands. uv pins the commit in `uv.lock`:
 
 ```bash
-uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --tag v0.1.0
-uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --rev 5d39e6988c1372dc16eebde9263ddb18f3812aa0
+uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --tag v0.2.0
+uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --rev <commit hash>
 ```
 
 With pip:
 
 ```bash
-pip install "UltraDict @ git+https://github.com/anush008/UltraDict@v0.1.0"
+pip install "UltraDict @ git+https://github.com/anush008/UltraDict@v0.2.0"
 ```
 
 For a Docker image without a C compiler, run `uv sync` in a build stage that has a C compiler, then copy the virtual environment into the final image.
@@ -501,7 +501,7 @@ python -m unittest
 ULTRADICT_PURE_PYTHON=1 python -m unittest
 ```
 
-To make a release, set `version` in `setup.py`, then push a tag with the same version, e.g. `v0.1.0`.
+To make a release, set `version` in `setup.py`, then push a tag with the same version, e.g. `v0.2.0`.
 
 `tests/api_check.py` calls every part of the public API and prints one line for each step. `tests/api_check_expected.txt` holds the output of the original implementation with the bug fixes below. The test `test_api_behavior_unchanged` fails if any step behaves differently.
 
