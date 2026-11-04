@@ -16,3 +16,18 @@ disable         = ["missing-module-docstring", "missing-class-docstring", "missi
 [tool.pylint.'DESIGN']
 max-attributes  = 22
 good-names-rgxs = "^[_a-z][_a-z0-9]?$"
+
+# Wheels with the C extension, see .github/workflows/wheels.yml
+[tool.cibuildwheel]
+build = "cp311-* cp312-* cp313-* cp314-*"
+test-requires = ["psutil"]
+test-command = "python {project}/tests/wheel_check.py"
+
+[tool.cibuildwheel.linux]
+archs = ["native"]
+
+[tool.cibuildwheel.macos]
+archs = ["native"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64", "x86"]
