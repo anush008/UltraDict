@@ -34,6 +34,14 @@ You can also install from the source on GitHub. Then pip builds the C extension,
 pip install "UltraDict @ git+https://github.com/anush008/UltraDict@v0.1.0"
 ```
 
+With uv, add the tag as a git source. uv pins the commit of the tag in `uv.lock`:
+
+```bash
+uv add "UltraDict @ git+https://github.com/anush008/UltraDict" --tag v0.1.0
+```
+
+For a Docker image without a C compiler, run `uv sync` in a build stage that has a C compiler, then copy the virtual environment into the final image.
+
 Always install a tag or a commit, never a branch, so each deploy gets the same code. All processes that share an UltraDict must use the same version of UltraDict, so update all of them together.
 
 ## General Concept
